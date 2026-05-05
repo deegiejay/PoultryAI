@@ -1,26 +1,3 @@
-"""
-firebase_db.py  —  Shared Firebase Realtime Database Layer
-============================================================
-Used by BOTH:
-  • cloud_ml_server.py  (writes predictions / alerts)
-  • fletapp.py          (reads everything, pure UI)
-
-Pure REST — no Firebase SDK. Works on Android APK, cloud server, desktop.
-
-SETUP (5 min, one-time):
-  1. https://console.firebase.google.com → New project
-  2. Build → Realtime Database → Create → Start in TEST mode
-  3. Copy URL and set FIREBASE_URL below (same in ALL files)
-
-Firebase structure:
-  /latest       → overwritten by ESP every 2s        (live display)
-  /readings     → append-only log per ESP POST        (history + ML)
-  /ml_result    → overwritten by cloud ML             (current prediction)
-  /forecast_7d  → overwritten by cloud ML             (7-day table)
-  /alerts       → append-only alert log
-  /ml_status    → cloud ML heartbeat
-"""
-
 import requests
 SESSION = requests.Session()
 import time
@@ -29,7 +6,7 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ▶▶  YOUR FIREBASE URL — matches your ESP32 sketch and Render env var
+#   YOUR FIREBASE URL — matches your ESP32 sketch and Render env var
 # ══════════════════════════════════════════════════════════════════════════════
 FIREBASE_URL = "https://poultry-ai-e901a-default-rtdb.firebaseio.com"
 # ══════════════════════════════════════════════════════════════════════════════
@@ -54,11 +31,6 @@ _lock = threading.Lock()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # INTERNAL REST HELPERS
-# NOTE: All helpers read FIREBASE_URL at call time so that
-#       cloud_ml_server.py can override it via:
-#           import firebase_db as db
-#           db.FIREBASE_URL = os.getenv("FIREBASE_URL")
-#       and the change takes effect immediately.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _base() -> str:
@@ -178,22 +150,19 @@ def get_readings(limit: int = 300):
         last_f = _cache["last_fetch"]
         cached_limit = int(_cache.get("readings_limit", 0) or 0)
 
-    # Only use cache if it was fetched with at least the requested limit.
-    # This prevents a small mobile query from breaking total count.
     if cached and (now - last_f) < CACHE_TTL and cached_limit >= limit:
         return cached[-limit:] if len(cached) > limit else cached
 
-    # Try ordered query first
+
     raw = _get("readings", f'?orderBy="timestamp"&limitToLast={limit}')
     if raw is None:
-        # Fallback: fetch without ordering (works even without index rules)
         raw = _get("readings")
 
     readings = _dict_values(raw)
     if readings:
-        # Client-side sort by timestamp. Legacy/partial rows are allowed.
+
         readings.sort(key=_reading_sort_key)
-        # Apply limit client-side
+
         if len(readings) > limit:
             readings = readings[-limit:]
         with _lock:
@@ -240,7 +209,7 @@ def get_forecast_7d() -> Optional[List[Dict]]:
     """Fetch 7-day forecast list from /forecast_7d."""
     data = _get("forecast_7d")
     if data:
-        # Firebase stores as numbered dict {"0":{...},"1":{...}}
+
         if isinstance(data, dict):
             def sort_key(item):
                 key, _row = item
@@ -387,26 +356,25 @@ def readings_to_df(readings: List[Dict]):
             if not isinstance(rec, dict):
                 continue
 
-            # Try Unix epoch timestamp first (what ESP sends via time(nullptr))
+
             ts_val = rec.get("timestamp")
             date = pd.NaT
             try:
                 ts_num = float(ts_val)
-                if ts_num > 1_000_000:          # looks like epoch
+                if ts_num > 1_000_000:          
                     date = pd.to_datetime(ts_num, unit="s", errors="coerce")
             except Exception:
                 pass
 
             if pd.isna(date):
-                # Fallback: ISO string from "ts" field
+
                 ts_iso = rec.get("ts", "")
                 date = pd.to_datetime(ts_iso, errors="coerce") if ts_iso else pd.NaT
 
             if pd.isna(date):
                 date = pd.Timestamp.now()
 
-            # Clamp sensor values to non-negative values before ML training.
-            # This prevents impossible readings and predictions like -0.00 kg.
+
             rows.append({
                 "date":         date,
                 "feed_kg":      _num(rec.get("weight"), 0.0, True),
@@ -426,7 +394,7 @@ def readings_to_df(readings: List[Dict]):
         return pd.DataFrame()
 
     df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
-    # Strip timezone if present (matplotlib + pandas tz-aware = crash)
+
     try:
         if df["date"].dt.tz is not None:
             df["date"] = df["date"].dt.tz_localize(None)
