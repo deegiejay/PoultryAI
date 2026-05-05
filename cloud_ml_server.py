@@ -1,25 +1,3 @@
-"""
-cloud_ml_server.py  —  Cloud ML Engine (Deploy to Render / Railway)
-=====================================================================
-Runs 24/7. No laptop. Trains models. Writes results to Firebase.
-APK reads results — zero ML on phone.
-
-DEPLOY TO RENDER (free tier):
-  1. Push these files to a GitHub repo:
-       cloud_ml_server.py, firebase_db.py, requirements.txt
-  2. render.com → New Web Service → connect repo
-  3. Build command:  pip install -r requirements.txt
-  4. Start command:  python cloud_ml_server.py
-  5. Environment vars → Add:
-       FIREBASE_URL = https://poultry-ai-e901a-default-rtdb.firebaseio.com
-  6. Deploy — done. Runs forever.
-
-RENDER FREE TIER NOTE:
-  Free services sleep after 15min of no HTTP traffic.
-  Add a free uptime monitor (e.g. UptimeRobot pinging /health every 5min)
-  to keep it awake 24/7.
-"""
-
 import os
 import sys
 import time
@@ -46,30 +24,28 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 import uvicorn
 
-# ─── Import firebase_db and override URL from env BEFORE any DB calls ────────
 import firebase_db as _db
 
 _env_url = os.getenv("FIREBASE_URL", "").strip()
 if _env_url:
-    _db.FIREBASE_URL = _env_url          # patch module-level var; _base() reads it live
+    _db.FIREBASE_URL = _env_url         
     print(f"[CONFIG] Firebase URL from env: {_db.FIREBASE_URL}")
 else:
     print(f"[CONFIG] Firebase URL from module: {_db.FIREBASE_URL}")
 
-# Use db as alias after patching
 db = _db
 
 # ═════════════════════════════════════════════════════════════════════════════
 # CONFIG
 # ═════════════════════════════════════════════════════════════════════════════
-RETRAIN_EVERY  = 20     # retrain when 20 new rows arrive
-MIN_ROWS       = 50     # minimum rows before first train
-MIN_DAILY_ROWS = 3      # switch to daily ML after at least this many days
-ROLLING_WINDOW = 1000   # use last N rows
-TRAIN_INTERVAL = 120    # retrain every N seconds even without new rows
+RETRAIN_EVERY  = 20     
+MIN_ROWS       = 50     
+MIN_DAILY_ROWS = 3      
+ROLLING_WINDOW = 1000   
+TRAIN_INTERVAL = 120    
 STARTUP_TRAIN_DELAY = 5
-FEED_SCHEDULE_HOURS = [3, 8, 11, 14]  # feeding schedule: 3AM, 8AM, 11AM, 2PM
-ANOMALY_Z      = 2.5    # Z-score threshold for anomaly detection
+FEED_SCHEDULE_HOURS = [3, 8, 11, 14]  
+ANOMALY_Z      = 2.5    
 
 BG      = "#0e1117"
 BORDER  = "#3d4257"
@@ -77,7 +53,7 @@ MUTED   = "#a0aec0"
 CFEED   = "#50C8FF"
 CWATER  = "#1f77b4"
 
-# IMPORTANT: must match FEATURES list used during training
+
 FEATURES = [
     "water_liters", "system", "day_of_week", "month",
     "hour", "lag1_feed", "lag1_water", "roll3_feed",
@@ -242,9 +218,6 @@ def build_schedule_predictions(last_row: pd.Series, recent_df: pd.DataFrame,
         schedule_hours = FEED_SCHEDULE_HOURS[:count]
         candidates = [target_day + timedelta(hours=hr) for hr in schedule_hours]
 
-        # Main behavior: split the one-day AI target equally across the daily schedule.
-        # This is the clearest farmer-facing computation: totals add back to the
-        # one-day prediction displayed in the AI Prediction card.
         if daily_feed is not None or daily_water is not None:
             total_feed = max(0.0, float(daily_feed or 0.0))
             total_water = max(0.0, float(daily_water or 0.0))
@@ -261,7 +234,6 @@ def build_schedule_predictions(last_row: pd.Series, recent_df: pd.DataFrame,
                 })
             return rows
 
-        # Fallback only: use model-specific hourly values when no daily total is given.
         tmp = recent_df.copy()
         for slot in candidates:
             xi = build_predict_row(tmp.iloc[-1], slot, tmp)
@@ -446,7 +418,7 @@ def train_once():
         except Exception:
             pass
 
-        # ── 1. Load data ──────────────────────────────────────────────────────
+        #  1. Load data 
         readings = db.get_readings(limit=ROLLING_WINDOW)
         if not readings:
             db.write_ml_status("waiting", 0, "No data in Firebase yet")
@@ -484,13 +456,13 @@ def train_once():
         print(f"[ML] Training on {total_rows} {training_source} rows "
               f"({daily_rows} daily / {raw_rows} raw)…")
 
-        # ── 2. Feature engineering ────────────────────────────────────────────
+        #  2. Feature engineering 
         df = add_features(df)
         X       = df[FEATURES].fillna(0)
         y_feed  = df["feed_kg"]
         y_water = df["water_liters"]
 
-        # ── 3. Train models ───────────────────────────────────────────────────
+        #  3. Train models
         def make_pipe():
             return Pipeline([
                 ("sc", StandardScaler()),
@@ -503,21 +475,20 @@ def train_once():
         m_feed.fit(X, y_feed)
         m_water.fit(X, y_water)
 
-        # ── 4. Next-day prediction ────────────────────────────────────────────
+        #  4. Next-day prediction 
         last   = df.iloc[-1]
         nd     = pd.to_datetime(last["date"]) + timedelta(days=1)
         inp    = build_predict_row(last, nd, df)
         feed_v = round(max(0.0, float(m_feed.predict(inp)[0])), 2)
         water_v= round(max(0.0, float(m_water.predict(inp)[0])), 2)
 
-        # ── 5. ARIMA (stable version)
+        #  5. ARIMA (stable version)
         arima_feed = arima_water = None
 
         if HAS_ARIMA and total_rows >= 30:
             try:
                 from statsmodels.tsa.arima.model import ARIMA
 
-                # Feed model (lighter)
                 af = ARIMA(
                     df["feed_kg"].values,
                     order=(1, 1, 1),
@@ -527,7 +498,6 @@ def train_once():
 
                 arima_feed = round(max(0.0, float(af.forecast(1)[0])), 2)
 
-                # Water model check if mostly same values
                 if df["water_liters"].nunique() <= 2:
                     arima_water = round(max(0.0, float(df["water_liters"].mean())), 2)
                 else:
@@ -549,14 +519,14 @@ def train_once():
             arima_feed = feed_v
             arima_water = water_v
 
-        # ── 6. Confidence / trend / anomaly ───────────────────────────────────
+        #  6. Confidence / trend / anomaly 
         conf  = calc_confidence(df, total_rows)
         trend = analyze_trend(df)
         anom  = detect_anomaly(df)
 
-        # ── 7. 7-day forecast (consistent features) ───────────────────────────
+        #  7. 7-day forecast (consistent features) 
         rows_7d = []
-        tmp     = df.copy()                # starts as engineered df
+        tmp     = df.copy()                
         for _ in range(7):
             l_row = tmp.iloc[-1]
             nd2   = pd.to_datetime(l_row["date"]) + timedelta(days=1)
@@ -568,7 +538,7 @@ def train_once():
                 "feed_kg":      round(fv, 2),
                 "water_liters": round(wv, 2),
             })
-            # Append new row with engineered features for next iteration
+
             new_row = pd.DataFrame([{
                 "date":         nd2,
                 "feed_kg":      fv,
@@ -585,11 +555,11 @@ def train_once():
             }])
             tmp = pd.concat([tmp, new_row], ignore_index=True)
 
-        # ── 8. Scheduled feeding prediction ─────────────────────────────────
+        #  8. Scheduled feeding prediction 
         schedule_rows = build_schedule_predictions(last, df, m_feed, m_water, count=4, target_date=nd, daily_feed=feed_v, daily_water=water_v)
         next_sched = schedule_rows[0] if schedule_rows else {}
 
-        # ── 9. Patterns ───────────────────────────────────────────────────────
+        #  9. Patterns 
         try:
             pat_sys   = df.groupby("system")[["feed_kg","water_liters"]].mean().to_dict()
             pat_day   = df.groupby("day_of_week")[["feed_kg","water_liters"]].mean().to_dict()
@@ -599,7 +569,7 @@ def train_once():
 
 
         chart_b64 = render_chart_b64(df, rows_7d)
-        # ── 9. Write to Firebase ──────────────────────────────────────────────
+        #  9. Write to Firebase 
         ml_result = {
             "feedKg":     feed_v,
             "waterL":     water_v,
@@ -624,7 +594,6 @@ def train_once():
             "patMonth":   pat_month,
             "chartB64":   chart_b64,
 
-            # Scheduled feeding prediction
             "feedSchedule": schedule_rows,
             "nextFeedTime": next_sched.get("time", ""),
             "nextFeedDate": next_sched.get("date", ""),
