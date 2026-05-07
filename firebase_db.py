@@ -8,7 +8,7 @@ from typing import Optional, List, Dict, Any
 # ══════════════════════════════════════════════════════════════════════════════
 # ▶▶  YOUR FIREBASE URL — matches your ESP32 sketch and Render env var
 # ══════════════════════════════════════════════════════════════════════════════
-FIREBASE_URL = "https://poultry-ai-e901a-default-rtdb.firebaseio.com"
+FIREBASE_URL = "https://poultry-database-2b2d1-default-rtdb.firebaseio.com"
 # ══════════════════════════════════════════════════════════════════════════════
 
 TIMEOUT   = 3
