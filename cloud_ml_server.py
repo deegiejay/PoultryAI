@@ -1,1037 +1,607 @@
 import os
+import sys
 import time
-import math
-import io
-import base64
 import threading
 import traceback
 import warnings
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any
 
 import numpy as np
 import pandas as pd
+import io
+import base64
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
+warnings.filterwarnings("ignore")
+
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 import uvicorn
 
-warnings.filterwarnings("ignore")
-
-# Firebase REST layer
+# ─── Import firebase_db and override URL from env BEFORE any DB calls ────────
 import firebase_db as _db
 
 _env_url = os.getenv("FIREBASE_URL", "").strip()
 if _env_url:
-    _db.FIREBASE_URL = _env_url
+    _db.FIREBASE_URL = _env_url          # patch module-level var; _base() reads it live
     print(f"[CONFIG] Firebase URL from env: {_db.FIREBASE_URL}")
 else:
     print(f"[CONFIG] Firebase URL from module: {_db.FIREBASE_URL}")
 
+# Use db as alias after patching
 db = _db
 
 # ═════════════════════════════════════════════════════════════════════════════
 # CONFIG
 # ═════════════════════════════════════════════════════════════════════════════
-RETRAIN_EVERY = 20
-MIN_ROWS = 50
-ROLLING_WINDOW = 1000
-TRAIN_INTERVAL = 120
+RETRAIN_EVERY  = 20     # retrain when 20 new rows arrive
+MIN_ROWS       = 50     # minimum rows before first train
+ROLLING_WINDOW = 1000   # use last N rows
+TRAIN_INTERVAL = 120    # retrain every N seconds even without new rows
 STARTUP_TRAIN_DELAY = 5
-FEED_SCHEDULE_HOURS = [3, 8, 11, 14]
+FEED_SCHEDULE_HOURS = [3, 8, 11, 14]  # feeding schedule: 3AM, 8AM, 11AM, 2PM
+ANOMALY_Z      = 2.5    # Z-score threshold for anomaly detection
 
-# Minimum meaningful changes. These reduce noise from load cell vibration and
-# very small flow pulses while still allowing real poultry consumption to count.
-MIN_FEED_DROP_KG = 0.01       # 10 g feed change
-MIN_WATER_DELTA_L = 0.001     # 1 mL water change
-LOAD_CELL_ACTIVE_KG = 0.02    # minimum load-cell value considered usable
-MAX_INTERVAL_SECONDS = 600    # cap delta-time for flow-derived water estimate
-MIN_VALID_DAYS_FOR_MODEL = 5
-MIN_VALID_DAYS_FOR_BASELINE = 1
+BG      = "#0e1117"
+BORDER  = "#3d4257"
+MUTED   = "#a0aec0"
+CFEED   = "#50C8FF"
+CWATER  = "#1f77b4"
 
-# Safety caps. Change only if your actual system uses bigger containers.
-MAX_REASONABLE_FEED_KG = 100.0
-MAX_REASONABLE_WATER_L = 10000.0
-ANOMALY_Z = 2.5
-
-BG = "#0e1117"
-BORDER = "#3d4257"
-MUTED = "#a0aec0"
-CFEED = "#50C8FF"
-CWATER = "#1f77b4"
-
-DAILY_FEATURES = [
-    "day_index", "day_of_week", "month",
-    "records", "avg_flow", "flow_active_rate", "level_ok_rate",
-    "mean_feed_remaining", "latest_water_total",
-    "feed_prev_day", "water_prev_day",
-    "roll3_feed_target", "roll3_water_target",
+# IMPORTANT: must match FEATURES list used during training
+FEATURES = [
+    "water_liters", "system", "day_of_week", "month",
+    "hour", "lag1_feed", "lag1_water", "roll3_feed",
 ]
 
+# ═════════════════════════════════════════════════════════════════════════════
+# IN-MEMORY STATE
+# ═════════════════════════════════════════════════════════════════════════════
 state: Dict[str, Any] = {
     "trained_rows": 0,
-    "valid_rows": 0,
-    "valid_days": 0,
-    "removed_rows": 0,
-    "training": False,
-    "status": "starting",
-    "error": "",
-    "model_mode": "starting",
+    "training":     False,
+    "status":       "starting",
+    "error":        "",
 }
-
-_lock = threading.Lock()
+_lock  = threading.Lock()
 _event = threading.Event()
-_workers_started = False
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# BASIC HELPERS
+# ML ANALYSIS HELPERS
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _safe_float(value, default: float = 0.0) -> float:
-    try:
-        if value is None or value == "":
-            return default
-        v = float(value)
-        if math.isnan(v) or math.isinf(v):
-            return default
-        return v
-    except Exception:
-        return default
-
-
-def _safe_int(value, default: int = 0) -> int:
-    try:
-        return int(float(value))
-    except Exception:
-        return default
-
-
-def _clamp(value: float, lo: float, hi: float) -> float:
-    try:
-        return max(lo, min(hi, float(value)))
-    except Exception:
-        return lo
-
-
-def _parse_date(rec: Dict[str, Any]) -> pd.Timestamp:
-    """Parse ESP timestamp. Returns NaT if no usable timestamp exists."""
-    ts_val = rec.get("timestamp")
-    try:
-        ts_num = float(ts_val)
-        if ts_num > 1_000_000:
-            return pd.to_datetime(ts_num, unit="s", errors="coerce")
-    except Exception:
-        pass
-
-    for key in ["ts", "date", "datetime", "createdAt"]:
-        text = str(rec.get(key, "") or "").strip()
-        if not text:
+def detect_anomaly(df: pd.DataFrame) -> Dict:
+    result = {"anomaly": False, "message": "", "value": 0.0}
+    if len(df) < 10:
+        return result
+    for col, label in [("feed_kg", "Feed/Weight"), ("water_liters", "Water")]:
+        vals = df[col].tail(50).dropna()
+        if len(vals) < 5:
             continue
+        z = abs((vals.iloc[-1] - vals.mean()) / (vals.std() + 1e-9))
+        if z > ANOMALY_Z:
+            result.update(
+                anomaly=True,
+                message=f"⚠️ {label} reading is {z:.1f}σ from normal ({vals.iloc[-1]:.3f})",
+                value=float(vals.iloc[-1]),
+            )
+            return result
+    return result
+
+
+def analyze_trend(df: pd.DataFrame) -> Dict:
+    result = {"trend": "stable", "icon": "✅", "feedDelta": 0.0, "waterDelta": 0.0}
+    if len(df) < 40:
+        return result
+    rec  = df.tail(20)
+    prev = df.iloc[-40:-20]
+
+    def safe_pct_change(current_mean, previous_mean):
+        """Avoid huge percent values when previous average is 0.00 or near zero."""
         try:
-            return pd.to_datetime(text, errors="coerce")
+            current_mean = float(current_mean)
+            previous_mean = float(previous_mean)
+            if abs(previous_mean) < 0.01:
+                if abs(current_mean) < 0.01:
+                    return 0.0
+                return 100.0 if current_mean > previous_mean else -100.0
+            value = ((current_mean - previous_mean) / abs(previous_mean)) * 100.0
+            return max(-100.0, min(100.0, value))
         except Exception:
-            pass
-    return pd.NaT
+            return 0.0
 
-
-def _first_number(rec: Dict[str, Any], keys: List[str], default: float = 0.0) -> float:
-    for key in keys:
-        if key in rec:
-            return _safe_float(rec.get(key), default)
-    return default
-
-
-def _choose_feed_weight(rec: Dict[str, Any]) -> Tuple[float, str]:
-    """
-    Choose the best feed/weight signal from ESP32.
-
-    Why this matters:
-      Some ESP code averages two load cells. If LC1=0.38 kg and LC2=0.00 kg,
-      the reported final weight becomes 0.19 kg. For ML training, that creates
-      false low feed data. This function uses the valid individual load-cell
-      reading when one side is zero, and averages only when both sides are
-      carrying usable weight.
-    """
-    reported = _first_number(rec, ["weight", "feed_kg", "feedKg", "feed", "currentWeight"], 0.0)
-    w1 = _first_number(rec, ["weight1", "loadCell1", "scale1", "lc1"], 0.0)
-    w2 = _first_number(rec, ["weight2", "loadCell2", "scale2", "lc2"], 0.0)
-
-    # Clean impossible values.
-    vals = []
-    for v in [w1, w2]:
-        if v >= LOAD_CELL_ACTIVE_KG and v <= MAX_REASONABLE_FEED_KG:
-            vals.append(float(v))
-
-    if len(vals) == 2:
-        chosen = float(np.mean(vals))
-        source = "weight1_weight2_average"
-    elif len(vals) == 1:
-        chosen = vals[0]
-        source = "single_valid_load_cell"
+    fd = safe_pct_change(rec["feed_kg"].mean(), prev["feed_kg"].mean())
+    wd = safe_pct_change(rec["water_liters"].mean(), prev["water_liters"].mean())
+    result["feedDelta"]  = round(fd, 2)
+    result["waterDelta"] = round(wd, 2)
+    if detect_anomaly(df)["anomaly"]:
+        result.update(trend="warning", icon="🚨")
+    elif abs(fd) < 5 and abs(wd) < 5:
+        result.update(trend="stable",     icon="✅")
+    elif fd > 5 or wd > 5:
+        result.update(trend="increasing", icon="📈")
     else:
-        chosen = max(0.0, min(float(reported), MAX_REASONABLE_FEED_KG))
-        source = "reported_weight"
-
-    # Protect against the common false-half value from averaging a valid cell with 0.
-    if vals and reported > 0 and reported < max(vals) * 0.70:
-        chosen = float(np.mean(vals))
-        source = "corrected_reported_half_weight"
-
-    return max(0.0, chosen), source
+        result.update(trend="decreasing", icon="📉")
+    return result
 
 
-def _level_to_ok(value) -> int:
-    """Convert water-level text into 1=available, 0=low/empty."""
-    t = str(value or "").strip().lower()
-    if not t:
-        return 0
-    low_words = ["empty", "low", "0%", "no water", "dry", "false", "off", "fill"]
-    if any(w in t for w in low_words):
-        return 0
-    return 1
+def calc_confidence(df: pd.DataFrame, rows: int) -> float:
+    row_score = min(1.0, max(0.0, (rows - MIN_ROWS) / max(1, 500 - MIN_ROWS)))
+    try:
+        cv = (df["feed_kg"].std()      / (df["feed_kg"].mean()      + 1e-9) +
+              df["water_liters"].std() / (df["water_liters"].mean() + 1e-9)) / 2
+        var_score = max(0.0, 1.0 - cv)
+    except Exception:
+        var_score = 0.5
+    return round(min(1.0, max(0.05, row_score * 0.6 + var_score * 0.4)), 2)
 
 
-def _status_has_error(rec: Dict[str, Any]) -> bool:
-    """Detect known sensor-error messages without treating flow=0 as error."""
-    status_keys = [
-        "status", "sensorStatus", "loadStatus", "loadCellStatus", "hx711Status",
-        "flowStatus", "waterStatus", "error", "message",
-    ]
-    joined = " ".join(str(rec.get(k, "") or "") for k in status_keys).strip().lower()
-    if not joined:
-        return False
-    bad_words = [
-        "not found", "missing", "disconnected", "offline", "nan", "invalid",
-        "sensor error", "hx711 error", "loadcell error", "failed", "fail",
-    ]
-    return any(w in joined for w in bad_words)
+def confidence_label(c: float) -> str:
+    if c >= 0.80: return "High"
+    if c >= 0.55: return "Medium"
+    if c >= 0.30: return "Low"
+    return "Very Low"
 
+
+def add_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add engineered features to DataFrame.
+    Called once during training and once per prediction row.
+    Single source of truth — prevents train/predict feature mismatch.
+    """
+    df = df.copy()
+    df["hour"]       = pd.to_datetime(df["date"]).dt.hour
+    df["lag1_feed"]  = df["feed_kg"].shift(1).fillna(df["feed_kg"].mean())
+    df["lag1_water"] = df["water_liters"].shift(1).fillna(df["water_liters"].mean())
+    df["roll3_feed"] = df["feed_kg"].rolling(3, min_periods=1).mean()
+    return df
+
+
+def build_predict_row(last_row: pd.Series, next_date: pd.Timestamp,
+                      recent_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build a single prediction input row with all FEATURES.
+    Uses last_row values for lag features.
+    """
+    return pd.DataFrame([{
+        "water_liters": float(last_row["water_liters"]),
+        "system":       int(last_row.get("system", 1)),
+        "day_of_week":  next_date.weekday(),
+        "month":        next_date.month,
+        "hour":         0,
+        "lag1_feed":    float(last_row["feed_kg"]),
+        "lag1_water":   float(last_row["water_liters"]),
+        "roll3_feed":   float(recent_df["feed_kg"].tail(3).mean()),
+    }])
 
 def _schedule_label(dt: pd.Timestamp) -> str:
+    """Human-readable feeding schedule label."""
     try:
         return dt.strftime("%I:%M %p").lstrip("0")
     except Exception:
         return str(dt)
 
 
-def _robust_recent_average(series: pd.Series, minimum: float = 0.0, tail: int = 3) -> float:
-    vals = pd.to_numeric(series, errors="coerce").dropna()
-    vals = vals[vals > minimum]
-    if vals.empty:
-        return 0.0
-    vals = vals.tail(tail)
-    # Median is safer than plain mean when one day has a sensor spike.
-    return float(vals.median())
-
-
-def _round2(x: float) -> float:
-    return round(max(0.0, float(x or 0.0)), 2)
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# DATA CLEANING + CONSUMPTION CALCULATION
-# ═════════════════════════════════════════════════════════════════════════════
-
-def readings_to_professional_df(readings: List[Dict[str, Any]]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+def build_schedule_predictions(last_row: pd.Series, recent_df: pd.DataFrame,
+                               m_feed, m_water, count: int = 4,
+                               target_date: pd.Timestamp = None,
+                               daily_feed: float = None,
+                               daily_water: float = None) -> list:
     """
-    Convert raw Firebase rows into clean sensor dataframe.
+    Build the full one-day feeding schedule shown in the APK.
 
-    This intentionally does NOT remove rows where flow is 0.00, because that is
-    normal when chickens are not drinking.
+    AI Prediction = one-day target.
+    Scheduled Prediction = the same one-day target divided into the fixed
+    feeding times: 3:00 AM, 8:00 AM, 11:00 AM, and 2:00 PM.
+
+    This avoids confusing partial schedules (only 1 or 2 rows) and keeps the
+    schedule total equal to the daily AI target when daily_feed/daily_water are
+    provided.
     """
     rows = []
-    raw_rows = len(readings or [])
-    skipped_bad_timestamp = 0
-    skipped_error_status = 0
-    skipped_range = 0
-
-    for rec in readings or []:
-        if not isinstance(rec, dict):
-            continue
-
-        date = _parse_date(rec)
-        if pd.isna(date):
-            skipped_bad_timestamp += 1
-            continue
-
-        feed_kg, feed_signal_source = _choose_feed_weight(rec)
-        water_liters = _first_number(rec, ["totalLiters", "water_liters", "waterL", "total_liters", "waterTotal"], 0.0)
-        flow = _first_number(rec, ["flow", "flowRate", "waterFlow", "flow_lpm"], 0.0)
-
-        if feed_kg < 0 or water_liters < 0 or flow < 0:
-            skipped_range += 1
-            continue
-        if feed_kg > MAX_REASONABLE_FEED_KG or water_liters > MAX_REASONABLE_WATER_L:
-            skipped_range += 1
-            continue
-
-        error_flag = _status_has_error(rec)
-        if error_flag:
-            skipped_error_status += 1
-            continue
-
-        level = str(rec.get("level", rec.get("waterLevel", rec.get("levelStatus", ""))) or "")
-        day_of_week = _safe_int(rec.get("dayOfWeek"), pd.Timestamp(date).dayofweek)
-        month = _safe_int(rec.get("month"), pd.Timestamp(date).month)
-
-        rows.append({
-            "date": date,
-            "feed_kg": feed_kg,
-            "raw_reported_weight": _first_number(rec, ["weight", "feed_kg", "feedKg", "feed", "currentWeight"], 0.0),
-            "weight1": _first_number(rec, ["weight1", "loadCell1", "scale1", "lc1"], 0.0),
-            "weight2": _first_number(rec, ["weight2", "loadCell2", "scale2", "lc2"], 0.0),
-            "feed_signal_source": feed_signal_source,
-            "water_liters": water_liters,
-            "flow": flow,
-            "level": level,
-            "level_ok": _level_to_ok(level),
-            "day_of_week": day_of_week,
-            "month": month,
-            "system": _safe_int(rec.get("system"), 1),
-        })
-
-    if not rows:
-        stats = {
-            "rawRows": raw_rows,
-            "validRows": 0,
-            "removedRows": raw_rows,
-            "skippedBadTimestamp": skipped_bad_timestamp,
-            "skippedSensorError": skipped_error_status,
-            "skippedOutOfRange": skipped_range,
-            "note": "No valid timestamped sensor rows available.",
-        }
-        return pd.DataFrame(), stats
-
-    df = pd.DataFrame(rows)
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
-
     try:
-        if df["date"].dt.tz is not None:
-            df["date"] = df["date"].dt.tz_localize(None)
-    except Exception:
-        pass
-
-    # Soft caps for sudden spikes. This does not force values to zero; it only
-    # prevents one abnormal row from dominating model training.
-    for col in ["feed_kg", "water_liters", "flow"]:
-        vals = df[col][df[col] > 0]
-        if len(vals) >= 20:
-            q99 = float(vals.quantile(0.99))
-            if q99 > 0:
-                df[col] = df[col].clip(upper=q99 * 1.50)
-
-    try:
-        feed_source_counts = df["feed_signal_source"].value_counts().to_dict()
-    except Exception:
-        feed_source_counts = {}
-
-    stats = {
-        "rawRows": raw_rows,
-        "validRows": int(len(df)),
-        "removedRows": int(max(0, raw_rows - len(df))),
-        "skippedBadTimestamp": int(skipped_bad_timestamp),
-        "skippedSensorError": int(skipped_error_status),
-        "skippedOutOfRange": int(skipped_range),
-        "feedSignalSourceCounts": feed_source_counts,
-        "flowZeroIsNormal": True,
-        "loadCellZeroIsHandled": True,
-    }
-    return df, stats
-
-
-def add_consumption_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute actual feed/water consumed from changes between readings."""
-    if df.empty:
-        return df
-
-    out = df.copy().sort_values("date").reset_index(drop=True)
-    out["hour"] = out["date"].dt.hour
-    out["date_day"] = out["date"].dt.date
-    out["flow_active"] = (out["flow"] > 0).astype(int)
-
-    # Time between readings. Used only for optional flow-derived water estimate.
-    dt_seconds = out["date"].diff().dt.total_seconds().fillna(0.0)
-    dt_seconds = dt_seconds.clip(lower=0.0, upper=MAX_INTERVAL_SECONDS)
-    out["dt_seconds"] = dt_seconds
-
-    # Feed: consumption is a DROP in remaining feed weight.
-    feed_drop = out["feed_kg"].shift(1) - out["feed_kg"]
-    feed_drop = feed_drop.fillna(0.0)
-    feed_drop = feed_drop.where(feed_drop >= MIN_FEED_DROP_KG, 0.0)
-
-    # Water: primary source is an INCREASE in accumulated total liters.
-    water_delta_total = out["water_liters"] - out["water_liters"].shift(1)
-    water_delta_total = water_delta_total.fillna(0.0)
-    water_delta_total = water_delta_total.where(water_delta_total >= MIN_WATER_DELTA_L, 0.0)
-
-    # Secondary source: if totalLiters is stuck/reset but flow is positive, estimate
-    # liters from flow rate (L/min) × elapsed minutes. Flow=0 is still normal standby.
-    water_delta_flow = (out["flow"].clip(lower=0.0) * (dt_seconds / 60.0)).fillna(0.0)
-    water_delta_flow = water_delta_flow.where(water_delta_flow >= MIN_WATER_DELTA_L, 0.0)
-
-    water_delta = water_delta_total.where(water_delta_total > 0, water_delta_flow)
-
-    # Robustly cap impossible one-row jumps. This protects the ML from sensor
-    # resets/disconnections while still preserving normal consumption data.
-    for name, series in [("feed_consumed", feed_drop), ("water_consumed", water_delta)]:
-        positive = series[series > 0]
-        if len(positive) >= 20:
-            median = float(positive.median())
-            q95 = float(positive.quantile(0.95))
-            cap = max(q95 * 2.0, median * 8.0, 0.01)
-            series = series.clip(upper=cap)
-        out[name] = series.clip(lower=0.0)
-
-    return out
-
-
-def build_daily_consumption_table(df: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate readings into daily feed/water consumption targets."""
-    if df.empty:
-        return pd.DataFrame()
-
-    g = df.groupby("date_day", sort=True)
-    daily = g.agg(
-        date=("date", "max"),
-        feed_target_kg=("feed_consumed", "sum"),
-        water_target_l=("water_consumed", "sum"),
-        records=("date", "count"),
-        avg_flow=("flow", "mean"),
-        flow_active_rate=("flow_active", "mean"),
-        level_ok_rate=("level_ok", "mean"),
-        mean_feed_remaining=("feed_kg", "mean"),
-        latest_water_total=("water_liters", "last"),
-    ).reset_index(drop=True)
-
-    daily["date"] = pd.to_datetime(daily["date"], errors="coerce")
-    daily = daily.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
-    daily["day_index"] = np.arange(len(daily), dtype=float)
-    daily["day_of_week"] = daily["date"].dt.dayofweek.astype(int)
-    daily["month"] = daily["date"].dt.month.astype(int)
-
-    daily["feed_prev_day"] = daily["feed_target_kg"].shift(1).fillna(0.0)
-    daily["water_prev_day"] = daily["water_target_l"].shift(1).fillna(0.0)
-    daily["roll3_feed_target"] = daily["feed_target_kg"].rolling(3, min_periods=1).median()
-    daily["roll3_water_target"] = daily["water_target_l"].rolling(3, min_periods=1).median()
-
-    for f in DAILY_FEATURES:
-        if f not in daily:
-            daily[f] = 0.0
-        daily[f] = pd.to_numeric(daily[f], errors="coerce").fillna(0.0)
-
-    daily["valid_feed_day"] = daily["feed_target_kg"] > MIN_FEED_DROP_KG
-    daily["valid_water_day"] = daily["water_target_l"] > MIN_WATER_DELTA_L
-    daily["valid_any_day"] = daily["valid_feed_day"] | daily["valid_water_day"]
-    return daily
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# PROFESSIONAL ML TRAINING / METRICS
-# ═════════════════════════════════════════════════════════════════════════════
-
-def make_model():
-    from sklearn.ensemble import GradientBoostingRegressor
-    from sklearn.pipeline import Pipeline
-    from sklearn.preprocessing import StandardScaler
-
-    return Pipeline([
-        ("scaler", StandardScaler()),
-        ("model", GradientBoostingRegressor(
-            n_estimators=160,
-            learning_rate=0.045,
-            max_depth=3,
-            subsample=0.85,
-            random_state=42,
-        )),
-    ])
-
-
-def _calc_metrics(y_true, y_pred) -> Dict[str, float]:
-    y_true = np.asarray(y_true, dtype=float)
-    y_pred = np.asarray(y_pred, dtype=float)
-    if y_true.size == 0:
-        return {"mae": 0.0, "rmse": 0.0, "mape": 0.0, "score": 0.50}
-    err = y_true - y_pred
-    mae = float(np.mean(np.abs(err)))
-    rmse = float(np.sqrt(np.mean(err ** 2)))
-    denom = np.maximum(np.abs(y_true), 1e-6)
-    mape = float(np.mean(np.abs(err) / denom) * 100.0)
-    mean_target = float(np.mean(np.abs(y_true)))
-    score = _clamp(1.0 - mae / (mean_target + 1e-6), 0.0, 1.0) if mean_target > 0 else 0.50
-    return {"mae": mae, "rmse": rmse, "mape": mape, "score": score}
-
-
-def train_target_model(daily: pd.DataFrame, target_col: str, valid_col: str) -> Dict[str, Any]:
-    """Train one daily target model. Falls back to baseline if days are few."""
-    valid = daily[daily[valid_col]].copy()
-    valid = valid[valid[target_col] > 0].reset_index(drop=True)
-
-    baseline = _robust_recent_average(valid[target_col], minimum=0.0, tail=3)
-    out = {
-        "model": None,
-        "mode": "baseline",
-        "baseline": baseline,
-        "valid_days": int(len(valid)),
-        "metrics": {"mae": 0.0, "rmse": 0.0, "mape": 0.0, "score": 0.50},
-    }
-
-    if len(valid) < MIN_VALID_DAYS_FOR_MODEL or valid[target_col].nunique() < 2:
-        return out
-
-    X = valid[DAILY_FEATURES].fillna(0.0)
-    y = valid[target_col].astype(float)
-
-    model = make_model()
-
-    # Time-series holdout: older rows train, newest rows validate.
-    test_n = max(1, min(3, int(round(len(valid) * 0.25))))
-    if len(valid) - test_n >= 3:
-        x_train, x_test = X.iloc[:-test_n], X.iloc[-test_n:]
-        y_train, y_test = y.iloc[:-test_n], y.iloc[-test_n:]
-        trial = make_model()
-        trial.fit(x_train, y_train)
-        pred = np.maximum(0.0, trial.predict(x_test))
-        metrics = _calc_metrics(y_test.values, pred)
-    else:
-        metrics = {"mae": 0.0, "rmse": 0.0, "mape": 0.0, "score": 0.55}
-
-    model.fit(X, y)
-    out.update({"model": model, "mode": "ml", "metrics": metrics})
-    return out
-
-
-def build_next_daily_features(daily: pd.DataFrame, next_date: pd.Timestamp) -> pd.DataFrame:
-    if daily.empty:
-        row = {f: 0.0 for f in DAILY_FEATURES}
-        row.update({"day_of_week": next_date.dayofweek, "month": next_date.month})
-        return pd.DataFrame([row])[DAILY_FEATURES]
-
-    last = daily.iloc[-1]
-    row = {
-        "day_index": float(last.get("day_index", len(daily) - 1)) + 1.0,
-        "day_of_week": int(next_date.dayofweek),
-        "month": int(next_date.month),
-        "records": float(max(1.0, daily["records"].tail(3).median())),
-        "avg_flow": float(max(0.0, daily["avg_flow"].tail(3).median())),
-        "flow_active_rate": float(_clamp(daily["flow_active_rate"].tail(3).median(), 0.0, 1.0)),
-        "level_ok_rate": float(_clamp(daily["level_ok_rate"].tail(3).median(), 0.0, 1.0)),
-        "mean_feed_remaining": float(max(0.0, daily["mean_feed_remaining"].tail(3).median())),
-        "latest_water_total": float(max(0.0, daily["latest_water_total"].tail(1).iloc[-1])),
-        "feed_prev_day": float(max(0.0, daily["feed_target_kg"].tail(1).iloc[-1])),
-        "water_prev_day": float(max(0.0, daily["water_target_l"].tail(1).iloc[-1])),
-        "roll3_feed_target": float(max(0.0, daily["feed_target_kg"].tail(3).median())),
-        "roll3_water_target": float(max(0.0, daily["water_target_l"].tail(3).median())),
-    }
-    return pd.DataFrame([{k: row.get(k, 0.0) for k in DAILY_FEATURES}])
-
-
-def predict_target(model_info: Dict[str, Any], daily: pd.DataFrame, target_col: str,
-                   next_features: pd.DataFrame, day_of_week: int) -> Tuple[float, str]:
-    """Predict one target and blend with recent/seasonal baseline for stability."""
-    recent = _robust_recent_average(daily[target_col], minimum=0.0, tail=3)
-
-    seasonal = 0.0
-    try:
-        same_dow = daily[(daily["day_of_week"] == day_of_week) & (daily[target_col] > 0)]
-        seasonal = _robust_recent_average(same_dow[target_col], minimum=0.0, tail=4)
-    except Exception:
-        pass
-
-    baseline = recent or model_info.get("baseline", 0.0) or seasonal
-    if model_info.get("model") is not None:
-        try:
-            model_v = max(0.0, float(model_info["model"].predict(next_features)[0]))
-            # If the model outputs zero while real recent consumption exists, do not
-            # allow false zero. Blend with real consumption baseline.
-            if baseline > 0 and model_v < baseline * 0.10:
-                final = baseline
-                source = "ml_corrected_by_recent_consumption"
-            else:
-                parts = [model_v * 0.60]
-                weight = 0.60
-                if recent > 0:
-                    parts.append(recent * 0.30)
-                    weight += 0.30
-                if seasonal > 0:
-                    parts.append(seasonal * 0.10)
-                    weight += 0.10
-                final = sum(parts) / max(weight, 1e-6)
-                source = "ml_consumption_blend"
-            return _round2(final), source
-        except Exception as e:
-            print(f"[ML] prediction fallback for {target_col}: {e}")
-
-    return _round2(baseline), "baseline_recent_consumption"
-
-
-def arima_forecast(series: pd.Series, fallback: float) -> float:
-    vals = pd.to_numeric(series, errors="coerce").dropna()
-    vals = vals[vals > 0]
-    if len(vals) < 7 or vals.nunique() < 2:
-        return _round2(fallback)
-    try:
-        from statsmodels.tsa.arima.model import ARIMA
-        model = ARIMA(vals.values, order=(1, 1, 1), enforce_stationarity=False,
-                      enforce_invertibility=False).fit()
-        return _round2(float(model.forecast(1)[0]))
-    except Exception as e:
-        print(f"[ML] ARIMA skipped: {e}")
-        return _round2(fallback)
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# CONFIDENCE, TREND, ANOMALY, FORECAST, CHART
-# ═════════════════════════════════════════════════════════════════════════════
-
-def confidence_label(c: float) -> str:
-    if c >= 0.80:
-        return "High"
-    if c >= 0.55:
-        return "Medium"
-    if c >= 0.30:
-        return "Low"
-    return "Very Low"
-
-
-def calc_confidence(raw_stats: Dict[str, Any], daily: pd.DataFrame,
-                    feed_info: Dict[str, Any], water_info: Dict[str, Any]) -> Tuple[float, Dict[str, Any]]:
-    raw_rows = int(raw_stats.get("rawRows", 0) or 0)
-    valid_rows = int(raw_stats.get("validRows", 0) or 0)
-    removed_rows = int(raw_stats.get("removedRows", 0) or 0)
-    valid_days = int(daily["valid_any_day"].sum()) if not daily.empty else 0
-
-    row_score = _clamp((valid_rows - MIN_ROWS) / max(1, 250 - MIN_ROWS), 0.0, 1.0)
-    day_score = _clamp(valid_days / 14.0, 0.0, 1.0)
-    quality_score = _clamp(valid_rows / max(1, raw_rows), 0.0, 1.0)
-    removal_penalty = _clamp(1.0 - removed_rows / max(1, raw_rows), 0.0, 1.0)
-
-    try:
-        latest_dt = pd.to_datetime(daily["date"].max()) if not daily.empty else pd.NaT
-        age_hours = max(0.0, (pd.Timestamp.now() - latest_dt).total_seconds() / 3600.0)
-        recency_score = _clamp(1.0 - max(0.0, age_hours - 2.0) / 72.0, 0.0, 1.0)
-    except Exception:
-        age_hours = None
-        recency_score = 0.50
-
-    feed_score = float(feed_info.get("metrics", {}).get("score", 0.50))
-    water_score = float(water_info.get("metrics", {}).get("score", 0.50))
-    model_score = _clamp((feed_score + water_score) / 2.0, 0.0, 1.0)
-
-    activity_score = 0.0
-    if not daily.empty:
-        activity_score = _clamp(float(daily["valid_any_day"].mean()) * 1.50, 0.0, 1.0)
-
-    # Professional confidence is multi-factor, not just row count.
-    conf = (
-        row_score * 0.15 +
-        day_score * 0.25 +
-        quality_score * 0.15 +
-        removal_penalty * 0.10 +
-        recency_score * 0.10 +
-        model_score * 0.15 +
-        activity_score * 0.10
-    )
-    conf = round(_clamp(conf, 0.0, 1.0), 2)
-
-    details = {
-        "rowScore": round(row_score, 2),
-        "dayScore": round(day_score, 2),
-        "dataQualityScore": round(quality_score, 2),
-        "removedRowsScore": round(removal_penalty, 2),
-        "recencyScore": round(recency_score, 2),
-        "modelScore": round(model_score, 2),
-        "activityScore": round(activity_score, 2),
-        "rawRows": raw_rows,
-        "validRows": valid_rows,
-        "removedRows": removed_rows,
-        "validDays": valid_days,
-        "ageHours": None if age_hours is None else round(age_hours, 2),
-    }
-    return conf, details
-
-
-def analyze_trend(daily: pd.DataFrame) -> Dict[str, Any]:
-    result = {"trend": "stable", "icon": "stable", "feedDelta": 0.0, "waterDelta": 0.0}
-    valid = daily[daily["valid_any_day"]].copy() if not daily.empty else pd.DataFrame()
-    if len(valid) < 4:
-        return result
-
-    recent = valid.tail(3)
-    previous = valid.iloc[-6:-3] if len(valid) >= 6 else valid.iloc[:-3]
-    if previous.empty:
-        return result
-
-    def pct(cur, prev):
-        cur = float(cur)
-        prev = float(prev)
-        if abs(prev) < 1e-6:
-            return 0.0 if abs(cur) < 1e-6 else 100.0
-        return _clamp(((cur - prev) / abs(prev)) * 100.0, -100.0, 100.0)
-
-    fd = pct(recent["feed_target_kg"].mean(), previous["feed_target_kg"].mean())
-    wd = pct(recent["water_target_l"].mean(), previous["water_target_l"].mean())
-    result["feedDelta"] = round(fd, 2)
-    result["waterDelta"] = round(wd, 2)
-
-    if abs(fd) < 5 and abs(wd) < 5:
-        result.update(trend="stable", icon="stable")
-    elif fd > 5 or wd > 5:
-        result.update(trend="increasing", icon="increasing")
-    else:
-        result.update(trend="decreasing", icon="decreasing")
-    return result
-
-
-def detect_anomaly(daily: pd.DataFrame) -> Dict[str, Any]:
-    result = {"anomaly": False, "message": "", "value": 0.0}
-    valid = daily[daily["valid_any_day"]].copy() if not daily.empty else pd.DataFrame()
-    if len(valid) < 8:
-        return result
-
-    for col, label, unit in [
-        ("feed_target_kg", "Feed consumption", "kg"),
-        ("water_target_l", "Water consumption", "L"),
-    ]:
-        vals = valid[col].tail(30).astype(float)
-        std = vals.std()
-        if std <= 1e-9:
-            continue
-        z = abs((vals.iloc[-1] - vals.mean()) / std)
-        if z > ANOMALY_Z:
-            result.update({
-                "anomaly": True,
-                "message": f"{label} is unusual compared with recent data ({vals.iloc[-1]:.2f} {unit}).",
-                "value": round(float(vals.iloc[-1]), 2),
+        base_dt = pd.to_datetime(last_row["date"])
+        target_day = pd.to_datetime(target_date).normalize() if target_date is not None else (base_dt + timedelta(days=1)).normalize()
+        schedule_hours = FEED_SCHEDULE_HOURS[:count]
+        candidates = [target_day + timedelta(hours=hr) for hr in schedule_hours]
+
+        # Main behavior: split the one-day AI target equally across the daily schedule.
+        # This is the clearest farmer-facing computation: totals add back to the
+        # one-day prediction displayed in the AI Prediction card.
+        if daily_feed is not None or daily_water is not None:
+            total_feed = max(0.0, float(daily_feed or 0.0))
+            total_water = max(0.0, float(daily_water or 0.0))
+            n = max(1, len(candidates))
+            feed_each = total_feed / n
+            water_each = total_water / n
+            for slot in candidates:
+                rows.append({
+                    "date": str(slot.date()),
+                    "time": _schedule_label(slot),
+                    "hour": int(slot.hour),
+                    "feed_kg": round(feed_each, 2),
+                    "water_liters": round(water_each, 2),
+                })
+            return rows
+
+        # Fallback only: use model-specific hourly values when no daily total is given.
+        tmp = recent_df.copy()
+        for slot in candidates:
+            xi = build_predict_row(tmp.iloc[-1], slot, tmp)
+            xi["hour"] = int(slot.hour)
+            xi["day_of_week"] = int(slot.weekday())
+            xi["month"] = int(slot.month)
+
+            fv = max(0.0, float(m_feed.predict(xi)[0]))
+            wv = max(0.0, float(m_water.predict(xi)[0]))
+
+            rows.append({
+                "date": str(slot.date()),
+                "time": _schedule_label(slot),
+                "hour": int(slot.hour),
+                "feed_kg": round(fv, 2),
+                "water_liters": round(wv, 2),
             })
-            return result
-    return result
 
+            new_row = pd.DataFrame([{
+                "date": slot,
+                "feed_kg": fv,
+                "water_liters": wv,
+                "system": int(last_row.get("system", 1)),
+                "day_of_week": int(slot.weekday()),
+                "month": int(slot.month),
+                "hour": int(slot.hour),
+                "lag1_feed": float(tmp.iloc[-1]["feed_kg"]),
+                "lag1_water": float(tmp.iloc[-1]["water_liters"]),
+                "roll3_feed": float(tmp["feed_kg"].tail(3).mean()),
+                "flow": 0.0,
+                "level": "0%",
+            }])
+            tmp = pd.concat([tmp, new_row], ignore_index=True)
 
-def build_schedule_predictions(target_date: pd.Timestamp, daily_feed: float, daily_water: float) -> List[Dict[str, Any]]:
-    target_day = pd.to_datetime(target_date).normalize()
-    n = len(FEED_SCHEDULE_HOURS)
-    feed_each = max(0.0, float(daily_feed or 0.0)) / max(1, n)
-    water_each = max(0.0, float(daily_water or 0.0)) / max(1, n)
-
-    rows = []
-    for hour in FEED_SCHEDULE_HOURS:
-        slot = target_day + timedelta(hours=hour)
-        rows.append({
-            "date": str(slot.date()),
-            "time": _schedule_label(slot),
-            "hour": int(slot.hour),
-            "feed_kg": round(feed_each, 2),
-            "water_liters": round(water_each, 2),
-        })
-    return rows
-
-
-def forecast_7_days(daily: pd.DataFrame, feed_info: Dict[str, Any], water_info: Dict[str, Any],
-                    first_feed: float, first_water: float, start_date: pd.Timestamp) -> List[Dict[str, Any]]:
-    rows = []
-    sim = daily.copy()
-    current_date = pd.to_datetime(start_date)
-
-    for i in range(7):
-        day = current_date + timedelta(days=i)
-        feats = build_next_daily_features(sim, day)
-
-        if i == 0:
-            fv, wv = _round2(first_feed), _round2(first_water)
-        else:
-            fv, _ = predict_target(feed_info, sim, "feed_target_kg", feats, day.dayofweek)
-            wv, _ = predict_target(water_info, sim, "water_target_l", feats, day.dayofweek)
-
-        rows.append({
-            "date": str(day.date()),
-            "feed_kg": _round2(fv),
-            "water_liters": _round2(wv),
-        })
-
-        # Append predicted day so later days can use lag/rolling features.
-        new = {col: 0.0 for col in sim.columns}
-        new.update({
-            "date": day,
-            "feed_target_kg": _round2(fv),
-            "water_target_l": _round2(wv),
-            "records": float(max(1.0, sim["records"].tail(3).median())) if not sim.empty else 1.0,
-            "avg_flow": float(sim["avg_flow"].tail(3).median()) if not sim.empty else 0.0,
-            "flow_active_rate": float(sim["flow_active_rate"].tail(3).median()) if not sim.empty else 0.0,
-            "level_ok_rate": float(sim["level_ok_rate"].tail(3).median()) if not sim.empty else 1.0,
-            "mean_feed_remaining": float(sim["mean_feed_remaining"].tail(3).median()) if not sim.empty else 0.0,
-            "latest_water_total": float(sim["latest_water_total"].tail(1).iloc[-1]) if not sim.empty else 0.0,
-            "day_index": float(len(sim)),
-            "day_of_week": int(day.dayofweek),
-            "month": int(day.month),
-            "feed_prev_day": float(sim["feed_target_kg"].tail(1).iloc[-1]) if not sim.empty else 0.0,
-            "water_prev_day": float(sim["water_target_l"].tail(1).iloc[-1]) if not sim.empty else 0.0,
-            "roll3_feed_target": float(sim["feed_target_kg"].tail(3).median()) if not sim.empty else _round2(fv),
-            "roll3_water_target": float(sim["water_target_l"].tail(3).median()) if not sim.empty else _round2(wv),
-            "valid_feed_day": fv > 0,
-            "valid_water_day": wv > 0,
-            "valid_any_day": (fv > 0 or wv > 0),
-        })
-        sim = pd.concat([sim, pd.DataFrame([new])], ignore_index=True)
+    except Exception as e:
+        print(f"[ML] schedule prediction skipped: {e}")
 
     return rows
 
-
-def render_chart_b64(daily: pd.DataFrame, forecast_rows: List[Dict[str, Any]]) -> str:
+def render_chart_b64(df: pd.DataFrame, forecast_rows: list = None) -> str:
+    """
+    Render feed vs water chart as base64 PNG.
+    Cloud server generates this; APK only displays it.
+    """
     try:
-        if daily.empty:
+        if df.empty:
             return ""
 
-        plot_df = daily.tail(60).copy()
+        plot_df = df.tail(200).copy()
+
         fig, ax = plt.subplots(figsize=(9, 4), facecolor=BG)
         ax.set_facecolor(BG)
 
-        ax.plot(plot_df["date"], plot_df["feed_target_kg"], color=CFEED, lw=2.0,
-                marker="o", ms=3, label="Daily Feed Consumed")
-        ax.plot(plot_df["date"], plot_df["water_target_l"], color=CWATER, lw=2.0,
-                marker="o", ms=3, label="Daily Water Consumed")
+        ax.plot(
+            plot_df["date"],
+            plot_df["feed_kg"],
+            color=CFEED,
+            lw=2.0,
+            marker="o",
+            ms=3,
+            label="Feed / Weight",
+        )
+
+        ax.plot(
+            plot_df["date"],
+            plot_df["water_liters"],
+            color=CWATER,
+            lw=2.0,
+            marker="o",
+            ms=3,
+            label="Water (L)",
+        )
 
         if forecast_rows:
-            fdf = pd.DataFrame(forecast_rows)
-            fdf["date"] = pd.to_datetime(fdf["date"])
-            ax.axvline(x=plot_df["date"].iloc[-1], color=BORDER, lw=1, ls="--", alpha=0.6)
-            ax.plot(fdf["date"], fdf["feed_kg"], color=CFEED, lw=1.8, ls="--", alpha=0.9,
-                    label="Feed Forecast")
-            ax.plot(fdf["date"], fdf["water_liters"], color=CWATER, lw=1.8, ls="--", alpha=0.9,
-                    label="Water Forecast")
+            try:
+                fdf = pd.DataFrame(forecast_rows)
+                fdf["date"] = pd.to_datetime(fdf["date"])
+
+                ax.axvline(
+                    x=plot_df["date"].iloc[-1],
+                    color=BORDER,
+                    lw=1,
+                    ls="--",
+                    alpha=0.5,
+                )
+
+                ax.plot(
+                    fdf["date"],
+                    fdf["feed_kg"],
+                    color=CFEED,
+                    lw=1.8,
+                    ls="--",
+                    alpha=0.8,
+                    label="Feed Forecast",
+                )
+
+                ax.plot(
+                    fdf["date"],
+                    fdf["water_liters"],
+                    color=CWATER,
+                    lw=1.8,
+                    ls="--",
+                    alpha=0.8,
+                    label="Water Forecast",
+                )
+            except Exception as e:
+                print(f"[CHART] forecast skipped: {e}")
 
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
         plt.xticks(rotation=25, color=MUTED, fontsize=8, ha="right")
         plt.yticks(color=MUTED, fontsize=9)
+
         ax.tick_params(colors=MUTED)
         ax.grid(axis="y", color=BORDER, lw=0.6, ls="--", alpha=0.7)
+
         for sp in ax.spines.values():
             sp.set_visible(False)
-        ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.22), ncol=2,
-                  frameon=False, labelcolor=MUTED, fontsize=8)
-        ax.set_title("Daily Consumption and Forecast", color=MUTED, fontsize=11, pad=8)
+
+        ax.legend(
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.22),
+            ncol=2,
+            frameon=False,
+            labelcolor=MUTED,
+            fontsize=8,
+        )
+
+        ax.set_title("Consumption Trends", color=MUTED, fontsize=11, pad=8)
+
         plt.tight_layout(pad=1.5)
 
         buf = io.BytesIO()
-        plt.savefig(buf, format="png", bbox_inches="tight", dpi=140, facecolor=BG)
+        plt.savefig(
+            buf,
+            format="png",
+            bbox_inches="tight",
+            dpi=140,
+            facecolor=BG,
+        )
         plt.close(fig)
+
         return base64.b64encode(buf.getvalue()).decode()
+
+
     except Exception as e:
         print(f"[CHART] error: {e}")
-        return ""
-
-
+        return None
 # ═════════════════════════════════════════════════════════════════════════════
 # MAIN TRAINING FUNCTION
 # ═════════════════════════════════════════════════════════════════════════════
 
 def train_once():
-    with _lock:
-        if state["training"]:
-            return False
-        state.update(training=True, status="training", error="")
+    """
+    Full training cycle:
+      1. Load readings from Firebase
+      2. Feature engineering
+      3. Train GradientBoosting models (feed + water)
+      4. Run ARIMA
+      5. Detect anomaly + trend
+      6. Forecast 7 days
+      7. Write all results back to Firebase
+    """
+    from sklearn.ensemble import GradientBoostingRegressor
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.pipeline import Pipeline
 
-    db.write_ml_status("training", state.get("trained_rows", 0))
+    HAS_ARIMA = False
+    try:
+        from statsmodels.tsa.arima.model import ARIMA
+        HAS_ARIMA = True
+    except Exception:
+        pass
+
+    with _lock:
+        state["training"] = True
+        state["status"]   = "training"
+
+    db.write_ml_status("training", state["trained_rows"])
 
     try:
+        # ── 1. Load data ──────────────────────────────────────────────────────
         readings = db.get_readings(limit=ROLLING_WINDOW)
         if not readings:
             db.write_ml_status("waiting", 0, "No data in Firebase yet")
             with _lock:
-                state.update(training=False, status="waiting", error="No data in Firebase yet")
-            return False
+                state.update(training=False, status="waiting")
+            return
 
-        raw_df, raw_stats = readings_to_professional_df(readings)
-        raw_rows = int(raw_stats.get("rawRows", 0) or 0)
-        valid_rows = int(raw_stats.get("validRows", 0) or 0)
-        removed_rows = int(raw_stats.get("removedRows", 0) or 0)
-
-        if raw_rows < MIN_ROWS:
-            msg = f"Need {MIN_ROWS} rows, have {raw_rows}"
-            db.write_ml_status("collecting", raw_rows, msg)
+        df = db.readings_to_df(readings)
+        if df.empty or len(df) < MIN_ROWS:
+            msg = f"Need {MIN_ROWS} rows, have {len(df)}"
+            db.write_ml_status("collecting", len(df), msg)
             with _lock:
-                state.update(training=False, status="collecting", trained_rows=raw_rows,
-                             valid_rows=valid_rows, removed_rows=removed_rows, error=msg)
-            return False
+                state.update(training=False, status="collecting",
+                             trained_rows=len(df))
+            return
 
-        if raw_df.empty or valid_rows < MIN_ROWS:
-            msg = f"Need {MIN_ROWS} valid sensor rows, have {valid_rows}"
-            db.write_ml_status("collecting_valid_data", raw_rows, msg)
-            with _lock:
-                state.update(training=False, status="collecting_valid_data", trained_rows=raw_rows,
-                             valid_rows=valid_rows, removed_rows=removed_rows, error=msg)
-            return False
+        total_rows = len(df)
+        print(f"[ML] Training on {total_rows} rows…")
 
-        event_df = add_consumption_columns(raw_df)
-        daily = build_daily_consumption_table(event_df)
-        valid_days = int(daily["valid_any_day"].sum()) if not daily.empty else 0
+        # ── 2. Feature engineering ────────────────────────────────────────────
+        df = add_features(df)
+        X       = df[FEATURES].fillna(0)
+        y_feed  = df["feed_kg"]
+        y_water = df["water_liters"]
 
-        print(f"[ML] Training rows={raw_rows}, valid_rows={valid_rows}, valid_days={valid_days}, removed={removed_rows}")
+        # ── 3. Train models ───────────────────────────────────────────────────
+        def make_pipe():
+            return Pipeline([
+                ("sc", StandardScaler()),
+                ("gb", GradientBoostingRegressor(
+                    n_estimators=100, max_depth=4, random_state=42)),
+            ])
 
-        if valid_days < MIN_VALID_DAYS_FOR_BASELINE:
-            msg = "Collecting valid consumption data. Sensor rows exist, but no feed/water consumption change has been detected yet."
-            db.write_ml_status("collecting_valid_data", raw_rows, msg)
-            with _lock:
-                state.update(training=False, status="collecting_valid_data", trained_rows=raw_rows,
-                             valid_rows=valid_rows, valid_days=valid_days, removed_rows=removed_rows,
-                             model_mode="waiting_for_consumption", error=msg)
-            return False
+        m_feed  = make_pipe()
+        m_water = make_pipe()
+        m_feed.fit(X, y_feed)
+        m_water.fit(X, y_water)
 
-        # Train feed and water target models using daily consumption targets.
-        feed_info = train_target_model(daily, "feed_target_kg", "valid_feed_day")
-        water_info = train_target_model(daily, "water_target_l", "valid_water_day")
+        # ── 4. Next-day prediction ────────────────────────────────────────────
+        last   = df.iloc[-1]
+        nd     = pd.to_datetime(last["date"]) + timedelta(days=1)
+        inp    = build_predict_row(last, nd, df)
+        feed_v = round(max(0.0, float(m_feed.predict(inp)[0])), 2)
+        water_v= round(max(0.0, float(m_water.predict(inp)[0])), 2)
 
-        last_date = pd.to_datetime(daily["date"].max())
-        pred_date = (last_date + timedelta(days=1)).normalize()
-        next_features = build_next_daily_features(daily, pred_date)
+        # ── 5. ARIMA (stable version)
+        arima_feed = arima_water = None
 
-        feed_v, feed_source = predict_target(feed_info, daily, "feed_target_kg", next_features, pred_date.dayofweek)
-        water_v, water_source = predict_target(water_info, daily, "water_target_l", next_features, pred_date.dayofweek)
+        if HAS_ARIMA and total_rows >= 30:
+            try:
+                from statsmodels.tsa.arima.model import ARIMA
 
-        # Final safety: if target is still zero but recent consumption exists, use recent consumption.
-        if feed_v <= 0:
-            feed_v = _round2(_robust_recent_average(daily["feed_target_kg"], 0.0, 3))
-        if water_v <= 0:
-            water_v = _round2(_robust_recent_average(daily["water_target_l"], 0.0, 3))
+                # Feed model (lighter)
+                af = ARIMA(
+                    df["feed_kg"].values,
+                    order=(1, 1, 1),
+                    enforce_stationarity=False,
+                    enforce_invertibility=False
+                ).fit()
 
-        # If both are still zero, do not call it ready.
-        if feed_v <= 0 and water_v <= 0:
-            msg = "No non-zero consumption target found after cleaning. Check load cell and water total readings."
-            db.write_ml_status("collecting_valid_data", raw_rows, msg)
-            with _lock:
-                state.update(training=False, status="collecting_valid_data", trained_rows=raw_rows,
-                             valid_rows=valid_rows, valid_days=valid_days, removed_rows=removed_rows,
-                             model_mode="no_nonzero_target", error=msg)
-            return False
+                arima_feed = round(max(0.0, float(af.forecast(1)[0])), 2)
 
-        arima_feed = arima_forecast(daily["feed_target_kg"], feed_v)
-        arima_water = arima_forecast(daily["water_target_l"], water_v)
-        rows_7d = forecast_7_days(daily, feed_info, water_info, feed_v, water_v, pred_date)
-        schedule_rows = build_schedule_predictions(pred_date, feed_v, water_v)
+                # Water model check if mostly same values
+                if df["water_liters"].nunique() <= 2:
+                    arima_water = round(max(0.0, float(df["water_liters"].mean())), 2)
+                else:
+                    aw = ARIMA(
+                        df["water_liters"].values,
+                        order=(1, 1, 0),
+                        enforce_stationarity=False,
+                        enforce_invertibility=False
+                    ).fit()
+
+                    arima_water = round(max(0.0, float(aw.forecast(1)[0])), 2)
+
+            except Exception as e:
+                print(f"[ML] ARIMA skipped: {e}")
+                arima_feed = feed_v
+                arima_water = water_v
+
+        else:
+            arima_feed = feed_v
+            arima_water = water_v
+
+        # ── 6. Confidence / trend / anomaly ───────────────────────────────────
+        conf  = calc_confidence(df, total_rows)
+        trend = analyze_trend(df)
+        anom  = detect_anomaly(df)
+
+        # ── 7. 7-day forecast (consistent features) ───────────────────────────
+        rows_7d = []
+        tmp     = df.copy()                # starts as engineered df
+        for _ in range(7):
+            l_row = tmp.iloc[-1]
+            nd2   = pd.to_datetime(l_row["date"]) + timedelta(days=1)
+            xi    = build_predict_row(l_row, nd2, tmp)
+            fv    = max(0.0, float(m_feed.predict(xi)[0]))
+            wv    = max(0.0, float(m_water.predict(xi)[0]))
+            rows_7d.append({
+                "date":         str(nd2.date()),
+                "feed_kg":      round(fv, 2),
+                "water_liters": round(wv, 2),
+            })
+            # Append new row with engineered features for next iteration
+            new_row = pd.DataFrame([{
+                "date":         nd2,
+                "feed_kg":      fv,
+                "water_liters": wv,
+                "system":       1,
+                "day_of_week":  nd2.weekday(),
+                "month":        nd2.month,
+                "hour":         0,
+                "lag1_feed":    l_row["feed_kg"],
+                "lag1_water":   l_row["water_liters"],
+                "roll3_feed":   float(tmp["feed_kg"].tail(3).mean()),
+                "flow":         0.0,
+                "level":        "0%",
+            }])
+            tmp = pd.concat([tmp, new_row], ignore_index=True)
+
+        # ── 8. Scheduled feeding prediction ─────────────────────────────────
+        schedule_rows = build_schedule_predictions(last, df, m_feed, m_water, count=4, target_date=nd, daily_feed=feed_v, daily_water=water_v)
         next_sched = schedule_rows[0] if schedule_rows else {}
 
-        conf, conf_details = calc_confidence(raw_stats, daily, feed_info, water_info)
-        trend = analyze_trend(daily)
-        anom = detect_anomaly(daily)
-
-        model_mode = "professional_consumption_ml"
-        if feed_info.get("mode") == "baseline" or water_info.get("mode") == "baseline":
-            model_mode = "professional_consumption_baseline_blend"
-
-        chart_b64 = render_chart_b64(daily, rows_7d)
-
+        # ── 9. Patterns ───────────────────────────────────────────────────────
         try:
-            pat_day = daily.groupby("day_of_week")[["feed_target_kg", "water_target_l"]].mean().to_dict()
-            pat_month = daily.groupby("month")[["feed_target_kg", "water_target_l"]].mean().to_dict()
-            pat_sys = {"consumption": {
-                "feed_target_kg": float(daily["feed_target_kg"].mean()),
-                "water_target_l": float(daily["water_target_l"].mean()),
-            }}
+            pat_sys   = df.groupby("system")[["feed_kg","water_liters"]].mean().to_dict()
+            pat_day   = df.groupby("day_of_week")[["feed_kg","water_liters"]].mean().to_dict()
+            pat_month = df.groupby("month")[["feed_kg","water_liters"]].mean().to_dict()
         except Exception:
-            pat_day = pat_month = pat_sys = {}
+            pat_sys = pat_day = pat_month = {}
 
-        metrics = {
-            "feedMAE": round(float(feed_info.get("metrics", {}).get("mae", 0.0)), 3),
-            "feedRMSE": round(float(feed_info.get("metrics", {}).get("rmse", 0.0)), 3),
-            "feedMAPE": round(float(feed_info.get("metrics", {}).get("mape", 0.0)), 2),
-            "waterMAE": round(float(water_info.get("metrics", {}).get("mae", 0.0)), 3),
-            "waterRMSE": round(float(water_info.get("metrics", {}).get("rmse", 0.0)), 3),
-            "waterMAPE": round(float(water_info.get("metrics", {}).get("mape", 0.0)), 2),
-        }
 
+        chart_b64 = render_chart_b64(df, rows_7d)
+        # ── 9. Write to Firebase ──────────────────────────────────────────────
         ml_result = {
-            # App-compatible keys
-            "feedKg": feed_v,
-            "waterL": water_v,
-            "predDate": str(pred_date.date()),
-            "arimaFeed": arima_feed,
+            "feedKg":     feed_v,
+            "waterL":     water_v,
+            "predDate":   str(nd.date()),
+            "arimaFeed":  arima_feed,
             "arimaWater": arima_water,
             "confidence": conf,
-            "confLabel": confidence_label(conf),
-            "trend": trend["trend"],
-            "trendIcon": trend["icon"],
-            "feedDelta": trend["feedDelta"],
+            "confLabel":  confidence_label(conf),
+            "trend":      trend["trend"],
+            "trendIcon":  trend["icon"],
+            "feedDelta":  trend["feedDelta"],
             "waterDelta": trend["waterDelta"],
-            "anomaly": anom["anomaly"],
+            "anomaly":    anom["anomaly"],
             "anomalyMsg": anom["message"],
-            "modelRows": raw_rows,
-            "trainedAt": datetime.utcnow().isoformat(),
-            "patSystem": pat_sys,
-            "patDay": pat_day,
-            "patMonth": pat_month,
-            "chartB64": chart_b64,
+            "modelRows":  total_rows,
+            "trainedAt":  datetime.utcnow().isoformat(),
+            "patSystem":  pat_sys,
+            "patDay":     pat_day,
+            "patMonth":   pat_month,
+            "chartB64":   chart_b64,
+
+            # Scheduled feeding prediction
             "feedSchedule": schedule_rows,
             "nextFeedTime": next_sched.get("time", ""),
             "nextFeedDate": next_sched.get("date", ""),
             "nextFeedKg": next_sched.get("feed_kg", 0.0),
             "nextFeedWaterL": next_sched.get("water_liters", 0.0),
-
-            # New professional ML details
-            "predictionReady": True,
-            "mlVersion": "objective_aligned_professional_v3",
-            "modelMode": model_mode,
-            "targetType": "daily_consumption_target",
-            "targetSource": f"feed:{feed_source}; water:{water_source}",
-            "dataQuality": raw_stats,
-            "confidenceDetails": conf_details,
-            "loadCellHandling": "Uses weight1/weight2 when available; averages only valid load-cell values and avoids averaging valid weight with 0.",
-            "waterHandling": "Uses totalLiters delta first; if totalLiters is stuck but flow is positive, estimates water from flow rate and elapsed time.",
-            "validTrainingRows": valid_rows,
-            "validTrainingDays": valid_days,
-            "removedInvalidRows": removed_rows,
-            "modelMetrics": metrics,
-            "estimatedError": {
-                "feedKgMAE": metrics["feedMAE"],
-                "waterLMAE": metrics["waterMAE"],
-                "meaning": "Average validation error based on recent holdout when enough valid days are available.",
-            },
-            "explanation": (
-                "Prediction is based on cleaned feed/water consumption changes. "
-                "Raw zero flow is allowed because chickens do not drink continuously. "
-                "Individual load-cell readings are checked to prevent false half-weight data when one load cell reads 0."
-            ),
         }
 
         ok1 = db.write_ml_result(ml_result)
         ok2 = db.write_forecast_7d(rows_7d)
-        db.write_ml_status("ready", raw_rows)
+        db.write_ml_status("ready", total_rows)
 
         if anom["anomaly"]:
             db.push_alert("anomaly", anom["message"], anom["value"])
 
         with _lock:
             state.update(
-                trained_rows=raw_rows,
-                valid_rows=valid_rows,
-                valid_days=valid_days,
-                removed_rows=removed_rows,
+                trained_rows=total_rows,
                 training=False,
                 status="ready",
                 error="",
-                model_mode=model_mode,
-                last_prediction={"feedKg": feed_v, "waterL": water_v, "confidence": conf},
             )
 
-        print(
-            f"[ML] ✅ feed={feed_v}kg water={water_v}L conf={int(conf*100)}% "
-            f"mode={model_mode} valid_days={valid_days} write={'ok' if ok1 and ok2 else 'FAILED'}"
-        )
-        return True
+        print(f"[ML] ✅ feed={feed_v}kg water={water_v}L "
+              f"conf={int(conf*100)}% trend={trend['trend']} "
+              f"firebase_write={'ok' if ok1 and ok2 else 'FAILED'}")
 
     except Exception as ex:
-        err = str(ex)[:250]
+        err = str(ex)[:200]
         print(f"[ML] ❌ {err}")
         print(traceback.format_exc())
         db.write_ml_status("error", state.get("trained_rows", 0), err)
         with _lock:
             state.update(training=False, status="error", error=err)
-        return False
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1039,6 +609,7 @@ def train_once():
 # ═════════════════════════════════════════════════════════════════════════════
 
 def startup_train_once():
+    """Run one delayed training attempt after server boot."""
     try:
         time.sleep(STARTUP_TRAIN_DELAY)
         train_once()
@@ -1048,7 +619,6 @@ def startup_train_once():
 
 def training_loop():
     last_trained_rows = 0
-    last_train_attempt = 0
     print("[ML] Training loop started")
 
     while True:
@@ -1060,61 +630,43 @@ def training_loop():
                     continue
 
             current = db.get_reading_count()
+
             if current < MIN_ROWS:
-                msg = f"Need {MIN_ROWS} rows, have {current}"
-                db.write_ml_status("collecting", current, msg)
+                db.write_ml_status("collecting", current,
+                                   f"Need {MIN_ROWS} rows, have {current}")
                 with _lock:
-                    state.update(status="collecting", trained_rows=current, error=msg)
+                    state.update(status="collecting", trained_rows=current)
                 continue
 
-            now = time.time()
             new_rows = current - last_trained_rows
-            due_by_rows = new_rows >= RETRAIN_EVERY or last_trained_rows == 0
-            due_by_time = (now - last_train_attempt) >= TRAIN_INTERVAL
-            if not (triggered or due_by_rows or due_by_time):
+            if new_rows < RETRAIN_EVERY and last_trained_rows > 0:
+                # Not enough new data — skip but update status
                 continue
 
-            last_train_attempt = now
-            if train_once():
-                last_trained_rows = db.get_reading_count()
+            train_once()
+            last_trained_rows = db.get_reading_count()
 
         except Exception:
             print(traceback.format_exc())
 
 
-def start_background_workers():
-    global _workers_started
-    with _lock:
-        if _workers_started:
-            return False
-        _workers_started = True
-    threading.Thread(target=training_loop, daemon=True).start()
-    threading.Thread(target=startup_train_once, daemon=True).start()
-    return True
-
-
 # ═════════════════════════════════════════════════════════════════════════════
-# FASTAPI
+# FASTAPI  — Render needs an HTTP server
 # ═════════════════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="Poultry Farm Professional ML Server")
-
-
-@app.on_event("startup")
-async def on_startup():
-    start_background_workers()
+app = FastAPI(title="Poultry Farm ML Server")
 
 
 @app.get("/")
 async def root():
     with _lock:
         s = dict(state)
-    return JSONResponse({"service": "Poultry Farm Professional ML", "state": s})
+    return JSONResponse({"service": "Poultry Farm ML", "state": s})
 
 
 @app.get("/health")
-@app.head("/health")
 async def health():
+    """Ping this every 5min with UptimeRobot to keep Render free tier awake."""
     return JSONResponse({"status": "ok", "ts": datetime.utcnow().isoformat()})
 
 
@@ -1125,10 +677,10 @@ async def get_status():
 
 
 @app.post("/retrain")
-@app.get("/retrain")
 async def force_retrain():
+    """POST to /retrain to manually trigger a training cycle."""
     _event.set()
-    return JSONResponse({"message": "Retrain queued", "note": "Check /status after a few seconds."})
+    return JSONResponse({"message": "Retrain triggered"})
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1137,12 +689,16 @@ async def force_retrain():
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  Poultry Farm Objective-Aligned Professional ML Server")
+    print("  Poultry Farm Cloud ML Server")
     print(f"  Firebase : {db.FIREBASE_URL}")
     print(f"  Retrains : every {RETRAIN_EVERY} rows or {TRAIN_INTERVAL}s")
     print(f"  Min rows : {MIN_ROWS}")
-    print("  Target   : daily feed/water consumption and scheduled decision support")
     print("=" * 60)
 
+    # Start training background threads
+    threading.Thread(target=training_loop, daemon=True).start()
+    threading.Thread(target=startup_train_once, daemon=True).start()
+
+    # Render injects PORT env var; default 8000 for local testing
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
