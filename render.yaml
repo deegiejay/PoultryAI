@@ -8,4 +8,4 @@ services:
     autoDeploy: true
     envVars:
       - key: FIREBASE_URL
-        value: https://poultry-ai-e901a-default-rtdb.firebaseio.com
+        value: https://poultry-database-2b2d1-default-rtdb.firebaseio.com
