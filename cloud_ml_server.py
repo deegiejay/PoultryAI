@@ -49,6 +49,8 @@ FEED_SCHEDULE_HOURS = [3, 8, 11, 14]
 # very small flow pulses while still allowing real poultry consumption to count.
 MIN_FEED_DROP_KG = 0.01       # 10 g feed change
 MIN_WATER_DELTA_L = 0.001     # 1 mL water change
+LOAD_CELL_ACTIVE_KG = 0.02    # minimum load-cell value considered usable
+MAX_INTERVAL_SECONDS = 600    # cap delta-time for flow-derived water estimate
 MIN_VALID_DAYS_FOR_MODEL = 5
 MIN_VALID_DAYS_FOR_BASELINE = 1
 
@@ -145,6 +147,45 @@ def _first_number(rec: Dict[str, Any], keys: List[str], default: float = 0.0) ->
     return default
 
 
+def _choose_feed_weight(rec: Dict[str, Any]) -> Tuple[float, str]:
+    """
+    Choose the best feed/weight signal from ESP32.
+
+    Why this matters:
+      Some ESP code averages two load cells. If LC1=0.38 kg and LC2=0.00 kg,
+      the reported final weight becomes 0.19 kg. For ML training, that creates
+      false low feed data. This function uses the valid individual load-cell
+      reading when one side is zero, and averages only when both sides are
+      carrying usable weight.
+    """
+    reported = _first_number(rec, ["weight", "feed_kg", "feedKg", "feed", "currentWeight"], 0.0)
+    w1 = _first_number(rec, ["weight1", "loadCell1", "scale1", "lc1"], 0.0)
+    w2 = _first_number(rec, ["weight2", "loadCell2", "scale2", "lc2"], 0.0)
+
+    # Clean impossible values.
+    vals = []
+    for v in [w1, w2]:
+        if v >= LOAD_CELL_ACTIVE_KG and v <= MAX_REASONABLE_FEED_KG:
+            vals.append(float(v))
+
+    if len(vals) == 2:
+        chosen = float(np.mean(vals))
+        source = "weight1_weight2_average"
+    elif len(vals) == 1:
+        chosen = vals[0]
+        source = "single_valid_load_cell"
+    else:
+        chosen = max(0.0, min(float(reported), MAX_REASONABLE_FEED_KG))
+        source = "reported_weight"
+
+    # Protect against the common false-half value from averaging a valid cell with 0.
+    if vals and reported > 0 and reported < max(vals) * 0.70:
+        chosen = float(np.mean(vals))
+        source = "corrected_reported_half_weight"
+
+    return max(0.0, chosen), source
+
+
 def _level_to_ok(value) -> int:
     """Convert water-level text into 1=available, 0=low/empty."""
     t = str(value or "").strip().lower()
@@ -219,7 +260,7 @@ def readings_to_professional_df(readings: List[Dict[str, Any]]) -> Tuple[pd.Data
             skipped_bad_timestamp += 1
             continue
 
-        feed_kg = _first_number(rec, ["weight", "feed_kg", "feedKg", "feed", "currentWeight"], 0.0)
+        feed_kg, feed_signal_source = _choose_feed_weight(rec)
         water_liters = _first_number(rec, ["totalLiters", "water_liters", "waterL", "total_liters", "waterTotal"], 0.0)
         flow = _first_number(rec, ["flow", "flowRate", "waterFlow", "flow_lpm"], 0.0)
 
@@ -242,6 +283,10 @@ def readings_to_professional_df(readings: List[Dict[str, Any]]) -> Tuple[pd.Data
         rows.append({
             "date": date,
             "feed_kg": feed_kg,
+            "raw_reported_weight": _first_number(rec, ["weight", "feed_kg", "feedKg", "feed", "currentWeight"], 0.0),
+            "weight1": _first_number(rec, ["weight1", "loadCell1", "scale1", "lc1"], 0.0),
+            "weight2": _first_number(rec, ["weight2", "loadCell2", "scale2", "lc2"], 0.0),
+            "feed_signal_source": feed_signal_source,
             "water_liters": water_liters,
             "flow": flow,
             "level": level,
@@ -282,6 +327,11 @@ def readings_to_professional_df(readings: List[Dict[str, Any]]) -> Tuple[pd.Data
             if q99 > 0:
                 df[col] = df[col].clip(upper=q99 * 1.50)
 
+    try:
+        feed_source_counts = df["feed_signal_source"].value_counts().to_dict()
+    except Exception:
+        feed_source_counts = {}
+
     stats = {
         "rawRows": raw_rows,
         "validRows": int(len(df)),
@@ -289,7 +339,9 @@ def readings_to_professional_df(readings: List[Dict[str, Any]]) -> Tuple[pd.Data
         "skippedBadTimestamp": int(skipped_bad_timestamp),
         "skippedSensorError": int(skipped_error_status),
         "skippedOutOfRange": int(skipped_range),
+        "feedSignalSourceCounts": feed_source_counts,
         "flowZeroIsNormal": True,
+        "loadCellZeroIsHandled": True,
     }
     return df, stats
 
@@ -304,15 +356,27 @@ def add_consumption_columns(df: pd.DataFrame) -> pd.DataFrame:
     out["date_day"] = out["date"].dt.date
     out["flow_active"] = (out["flow"] > 0).astype(int)
 
+    # Time between readings. Used only for optional flow-derived water estimate.
+    dt_seconds = out["date"].diff().dt.total_seconds().fillna(0.0)
+    dt_seconds = dt_seconds.clip(lower=0.0, upper=MAX_INTERVAL_SECONDS)
+    out["dt_seconds"] = dt_seconds
+
     # Feed: consumption is a DROP in remaining feed weight.
     feed_drop = out["feed_kg"].shift(1) - out["feed_kg"]
     feed_drop = feed_drop.fillna(0.0)
     feed_drop = feed_drop.where(feed_drop >= MIN_FEED_DROP_KG, 0.0)
 
-    # Water: consumption is an INCREASE in accumulated total liters.
-    water_delta = out["water_liters"] - out["water_liters"].shift(1)
-    water_delta = water_delta.fillna(0.0)
-    water_delta = water_delta.where(water_delta >= MIN_WATER_DELTA_L, 0.0)
+    # Water: primary source is an INCREASE in accumulated total liters.
+    water_delta_total = out["water_liters"] - out["water_liters"].shift(1)
+    water_delta_total = water_delta_total.fillna(0.0)
+    water_delta_total = water_delta_total.where(water_delta_total >= MIN_WATER_DELTA_L, 0.0)
+
+    # Secondary source: if totalLiters is stuck/reset but flow is positive, estimate
+    # liters from flow rate (L/min) × elapsed minutes. Flow=0 is still normal standby.
+    water_delta_flow = (out["flow"].clip(lower=0.0) * (dt_seconds / 60.0)).fillna(0.0)
+    water_delta_flow = water_delta_flow.where(water_delta_flow >= MIN_WATER_DELTA_L, 0.0)
+
+    water_delta = water_delta_total.where(water_delta_total > 0, water_delta_flow)
 
     # Robustly cap impossible one-row jumps. This protects the ML from sensor
     # resets/disconnections while still preserving normal consumption data.
@@ -910,12 +974,14 @@ def train_once():
 
             # New professional ML details
             "predictionReady": True,
-            "mlVersion": "professional_consumption_v2",
+            "mlVersion": "objective_aligned_professional_v3",
             "modelMode": model_mode,
             "targetType": "daily_consumption_target",
             "targetSource": f"feed:{feed_source}; water:{water_source}",
             "dataQuality": raw_stats,
             "confidenceDetails": conf_details,
+            "loadCellHandling": "Uses weight1/weight2 when available; averages only valid load-cell values and avoids averaging valid weight with 0.",
+            "waterHandling": "Uses totalLiters delta first; if totalLiters is stuck but flow is positive, estimates water from flow rate and elapsed time.",
             "validTrainingRows": valid_rows,
             "validTrainingDays": valid_days,
             "removedInvalidRows": removed_rows,
@@ -927,7 +993,8 @@ def train_once():
             },
             "explanation": (
                 "Prediction is based on cleaned feed/water consumption changes. "
-                "Raw zero flow is allowed because chickens do not drink continuously."
+                "Raw zero flow is allowed because chickens do not drink continuously. "
+                "Individual load-cell readings are checked to prevent false half-weight data when one load cell reads 0."
             ),
         }
 
@@ -1070,11 +1137,11 @@ async def force_retrain():
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  Poultry Farm Professional Cloud ML Server")
+    print("  Poultry Farm Objective-Aligned Professional ML Server")
     print(f"  Firebase : {db.FIREBASE_URL}")
     print(f"  Retrains : every {RETRAIN_EVERY} rows or {TRAIN_INTERVAL}s")
     print(f"  Min rows : {MIN_ROWS}")
-    print("  Target   : daily feed/water consumption")
+    print("  Target   : daily feed/water consumption and scheduled decision support")
     print("=" * 60)
 
     port = int(os.getenv("PORT", 8000))
