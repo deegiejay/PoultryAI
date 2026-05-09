@@ -8,7 +8,7 @@ from typing import Optional, List, Dict, Any
 # ══════════════════════════════════════════════════════════════════════════════
 # ▶▶  YOUR FIREBASE URL — matches your ESP32 sketch and Render env var
 # ══════════════════════════════════════════════════════════════════════════════
-FIREBASE_URL = "https://poultry-database-2b2d1-default-rtdb.firebaseio.com"
+FIREBASE_URL = ("https://poultry-database-2b2d1-default-rtdb.firebaseio.com")
 # ══════════════════════════════════════════════════════════════════════════════
 
 TIMEOUT   = 3
@@ -383,3 +383,83 @@ def get_cached_reading_count() -> int:
             return len(_cache.get("readings", []) or [])
     except Exception:
         return 0
+ 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# IMPROVED ML DATASET: actual consumption instead of raw remaining values
+# ═════════════════════════════════════════════════════════════════════════════
+def readings_to_consumption_df(readings: List[Dict]):
+    """
+    Convert ESP32 Firebase readings into an hourly consumption DataFrame for ML.
+
+    Why this is better:
+      - feed_kg becomes actual feed consumed, computed from weight decrease
+      - water_liters becomes actual water used, computed from totalLiters delta
+      - refills/resets/invalid jumps are ignored instead of being trained as real use
+
+    ESP still sends raw readings:
+      weight       = current feed/container weight
+      totalLiters  = cumulative water counter from the flow sensor
+
+    ML training receives:
+      feed_kg      = hourly feed consumption
+      water_liters = hourly water consumption
+    """
+    import pandas as pd
+
+    raw = readings_to_df(readings)
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+
+    df = raw.copy().sort_values("date").reset_index(drop=True)
+    if len(df) < 2:
+        return df
+
+    # Raw values from ESP32.
+    df["feed_weight_raw"] = pd.to_numeric(df["feed_kg"], errors="coerce").fillna(0).clip(lower=0)
+    df["water_total_raw"] = pd.to_numeric(df["water_liters"], errors="coerce").fillna(0).clip(lower=0)
+
+    # Time gap helps reject very stale jumps.
+    df["dt_seconds"] = df["date"].diff().dt.total_seconds().fillna(0).clip(lower=0)
+
+    # Feed consumed = previous weight - current weight.
+    # If weight increases, that is likely refill/add feed, not consumption.
+    feed_drop = df["feed_weight_raw"].shift(1) - df["feed_weight_raw"]
+    df["feed_consumed"] = feed_drop.where((feed_drop > 0.005) & (feed_drop <= 5.0), 0.0)
+
+    # Water consumed = current totalLiters - previous totalLiters.
+    # If totalLiters decreases, the ESP counter was reset; ignore that interval.
+    water_delta = df["water_total_raw"] - df["water_total_raw"].shift(1)
+    df["water_consumed"] = water_delta.where((water_delta > 0.0005) & (water_delta <= 20.0), 0.0)
+
+    # Reject impossible intervals from stale/disconnected data.
+    # Normal Firebase sends are seconds apart; if a gap is very long, the next delta may be misleading.
+    stale = df["dt_seconds"] > 3600
+    df.loc[stale, ["feed_consumed", "water_consumed"]] = 0.0
+
+    # Group by hour so ML predicts consumption pattern, not every noisy raw sensor tick.
+    df["hour_bucket"] = df["date"].dt.floor("H")
+    g = df.groupby("hour_bucket", as_index=False).agg(
+        feed_kg=("feed_consumed", "sum"),
+        water_liters=("water_consumed", "sum"),
+        flow=("flow", "mean"),
+        level=("level", "last"),
+        system=("system", "last"),
+    )
+    g = g.rename(columns={"hour_bucket": "date"})
+    g["day_of_week"] = pd.to_datetime(g["date"]).dt.dayofweek
+    g["month"] = pd.to_datetime(g["date"]).dt.month
+
+    # Keep only non-negative, sensible values.
+    g["feed_kg"] = pd.to_numeric(g["feed_kg"], errors="coerce").fillna(0).clip(lower=0, upper=10)
+    g["water_liters"] = pd.to_numeric(g["water_liters"], errors="coerce").fillna(0).clip(lower=0, upper=50)
+
+    # If there is not enough real movement yet, fall back to raw rows so ML status does not break,
+    # but mark it clearly for the server/status output.
+    if len(g) < 5 or (g["feed_kg"].sum() <= 0 and g["water_liters"].sum() <= 0):
+        fallback = raw.copy()
+        fallback["data_mode"] = "raw_fallback_no_valid_consumption_yet"
+        return fallback
+
+    g["data_mode"] = "hourly_actual_consumption"
+    return g.sort_values("date").reset_index(drop=True)
