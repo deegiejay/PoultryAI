@@ -40,7 +40,7 @@ db = _db
 # CONFIG
 # ═════════════════════════════════════════════════════════════════════════════
 RETRAIN_EVERY  = 20     # retrain when 20 new rows arrive
-MIN_ROWS       = 50     # minimum rows before first train
+MIN_ROWS       = 20     # minimum hourly consumption rows before first train
 ROLLING_WINDOW = 1000   # use last N rows
 TRAIN_INTERVAL = 120    # retrain every N seconds even without new rows
 STARTUP_TRAIN_DELAY = 5
@@ -378,6 +378,64 @@ def render_chart_b64(df: pd.DataFrame, forecast_rows: list = None) -> str:
     except Exception as e:
         print(f"[CHART] error: {e}")
         return None
+
+def predict_daily_target(last_row: pd.Series, target_day: pd.Timestamp,
+                         recent_df: pd.DataFrame, m_feed, m_water) -> tuple:
+    """
+    Predict a full one-day target by summing 24 hourly predictions.
+    This keeps the displayed AI target aligned with the thesis objective:
+    predict daily feed/water consumption needs, not just the next raw sensor reading.
+    """
+    rows = []
+    tmp = recent_df.copy()
+    target_day = pd.to_datetime(target_day).normalize()
+    for hr in range(24):
+        slot = target_day + timedelta(hours=hr)
+        xi = build_predict_row(tmp.iloc[-1], slot, tmp)
+        xi["hour"] = int(hr)
+        xi["day_of_week"] = int(slot.weekday())
+        xi["month"] = int(slot.month)
+
+        fv = max(0.0, float(m_feed.predict(xi)[0]))
+        wv = max(0.0, float(m_water.predict(xi)[0]))
+
+        # Guard rails: prevent one noisy model step from producing unrealistic daily totals.
+        try:
+            feed_cap = max(0.25, float(tmp["feed_kg"].quantile(0.95)) * 3.0)
+            water_cap = max(0.25, float(tmp["water_liters"].quantile(0.95)) * 3.0)
+            fv = min(fv, feed_cap)
+            wv = min(wv, water_cap)
+        except Exception:
+            pass
+
+        rows.append({
+            "date": str(slot.date()),
+            "time": _schedule_label(slot),
+            "hour": int(hr),
+            "feed_kg": round(fv, 4),
+            "water_liters": round(wv, 4),
+        })
+
+        new_row = pd.DataFrame([{
+            "date": slot,
+            "feed_kg": fv,
+            "water_liters": wv,
+            "system": int(last_row.get("system", 1)),
+            "day_of_week": int(slot.weekday()),
+            "month": int(slot.month),
+            "hour": int(hr),
+            "lag1_feed": float(tmp.iloc[-1]["feed_kg"]),
+            "lag1_water": float(tmp.iloc[-1]["water_liters"]),
+            "roll3_feed": float(tmp["feed_kg"].tail(3).mean()),
+            "flow": 0.0,
+            "level": "0%",
+        }])
+        tmp = pd.concat([tmp, new_row], ignore_index=True)
+
+    daily_feed = round(sum(r["feed_kg"] for r in rows), 2)
+    daily_water = round(sum(r["water_liters"] for r in rows), 2)
+    return daily_feed, daily_water, rows
+
 # ═════════════════════════════════════════════════════════════════════════════
 # MAIN TRAINING FUNCTION
 # ═════════════════════════════════════════════════════════════════════════════
@@ -419,7 +477,11 @@ def train_once():
                 state.update(training=False, status="waiting")
             return
 
-        df = db.readings_to_df(readings)
+        # Improved: train on actual hourly consumption when available, not raw remaining feed/water.
+        if hasattr(db, "readings_to_consumption_df"):
+            df = db.readings_to_consumption_df(readings)
+        else:
+            df = db.readings_to_df(readings)
         if df.empty or len(df) < MIN_ROWS:
             msg = f"Need {MIN_ROWS} rows, have {len(df)}"
             db.write_ml_status("collecting", len(df), msg)
@@ -450,87 +512,49 @@ def train_once():
         m_feed.fit(X, y_feed)
         m_water.fit(X, y_water)
 
-        # ── 4. Next-day prediction ────────────────────────────────────────────
+        # ── 4. Next-day daily prediction ──────────────────────────────────────
         last   = df.iloc[-1]
-        nd     = pd.to_datetime(last["date"]) + timedelta(days=1)
-        inp    = build_predict_row(last, nd, df)
-        feed_v = round(max(0.0, float(m_feed.predict(inp)[0])), 2)
-        water_v= round(max(0.0, float(m_water.predict(inp)[0])), 2)
+        nd     = (pd.to_datetime(last["date"]) + timedelta(days=1)).normalize()
+        feed_v, water_v, hourly_rows = predict_daily_target(last, nd, df, m_feed, m_water)
 
-        # ── 5. ARIMA (stable version)
-        arima_feed = arima_water = None
-
-        if HAS_ARIMA and total_rows >= 30:
+        # ── 5. ARIMA daily forecast (secondary reference) ─────────────────────
+        arima_feed = feed_v
+        arima_water = water_v
+        if HAS_ARIMA:
             try:
-                from statsmodels.tsa.arima.model import ARIMA
-
-                # Feed model (lighter)
-                af = ARIMA(
-                    df["feed_kg"].values,
-                    order=(1, 1, 1),
-                    enforce_stationarity=False,
-                    enforce_invertibility=False
-                ).fit()
-
-                arima_feed = round(max(0.0, float(af.forecast(1)[0])), 2)
-
-                # Water model check if mostly same values
-                if df["water_liters"].nunique() <= 2:
-                    arima_water = round(max(0.0, float(df["water_liters"].mean())), 2)
-                else:
-                    aw = ARIMA(
-                        df["water_liters"].values,
-                        order=(1, 1, 0),
-                        enforce_stationarity=False,
-                        enforce_invertibility=False
-                    ).fit()
-
-                    arima_water = round(max(0.0, float(aw.forecast(1)[0])), 2)
-
+                daily_df = df.set_index("date")[["feed_kg", "water_liters"]].resample("D").sum().fillna(0)
+                if len(daily_df) >= 4:
+                    af = ARIMA(daily_df["feed_kg"].values, order=(1, 1, 1),
+                               enforce_stationarity=False,
+                               enforce_invertibility=False).fit()
+                    arima_feed = round(max(0.0, float(af.forecast(1)[0])), 2)
+                    if daily_df["water_liters"].nunique() <= 2:
+                        arima_water = round(max(0.0, float(daily_df["water_liters"].mean())), 2)
+                    else:
+                        aw = ARIMA(daily_df["water_liters"].values, order=(1, 1, 0),
+                                   enforce_stationarity=False,
+                                   enforce_invertibility=False).fit()
+                        arima_water = round(max(0.0, float(aw.forecast(1)[0])), 2)
             except Exception as e:
-                print(f"[ML] ARIMA skipped: {e}")
+                print(f"[ML] daily ARIMA skipped: {e}")
                 arima_feed = feed_v
                 arima_water = water_v
-
-        else:
-            arima_feed = feed_v
-            arima_water = water_v
 
         # ── 6. Confidence / trend / anomaly ───────────────────────────────────
         conf  = calc_confidence(df, total_rows)
         trend = analyze_trend(df)
         anom  = detect_anomaly(df)
 
-        # ── 7. 7-day forecast (consistent features) ───────────────────────────
+        # ── 7. 7-day forecast as daily consumption targets ───────────────────
         rows_7d = []
-        tmp     = df.copy()                # starts as engineered df
-        for _ in range(7):
-            l_row = tmp.iloc[-1]
-            nd2   = pd.to_datetime(l_row["date"]) + timedelta(days=1)
-            xi    = build_predict_row(l_row, nd2, tmp)
-            fv    = max(0.0, float(m_feed.predict(xi)[0]))
-            wv    = max(0.0, float(m_water.predict(xi)[0]))
+        for day_i in range(7):
+            target_day = nd + timedelta(days=day_i)
+            fv, wv, _ = predict_daily_target(last, target_day, df, m_feed, m_water)
             rows_7d.append({
-                "date":         str(nd2.date()),
-                "feed_kg":      round(fv, 2),
+                "date": str(target_day.date()),
+                "feed_kg": round(fv, 2),
                 "water_liters": round(wv, 2),
             })
-            # Append new row with engineered features for next iteration
-            new_row = pd.DataFrame([{
-                "date":         nd2,
-                "feed_kg":      fv,
-                "water_liters": wv,
-                "system":       1,
-                "day_of_week":  nd2.weekday(),
-                "month":        nd2.month,
-                "hour":         0,
-                "lag1_feed":    l_row["feed_kg"],
-                "lag1_water":   l_row["water_liters"],
-                "roll3_feed":   float(tmp["feed_kg"].tail(3).mean()),
-                "flow":         0.0,
-                "level":        "0%",
-            }])
-            tmp = pd.concat([tmp, new_row], ignore_index=True)
 
         # ── 8. Scheduled feeding prediction ─────────────────────────────────
         schedule_rows = build_schedule_predictions(last, df, m_feed, m_water, count=4, target_date=nd, daily_feed=feed_v, daily_water=water_v)
@@ -567,6 +591,9 @@ def train_once():
             "patDay":     pat_day,
             "patMonth":   pat_month,
             "chartB64":   chart_b64,
+            "dataMode":   str(df.get("data_mode", pd.Series(["unknown"])).iloc[-1]) if "data_mode" in df.columns else "unknown",
+            "targetType": "daily_actual_consumption",
+            "validRows":  total_rows,
 
             # Scheduled feeding prediction
             "feedSchedule": schedule_rows,
