@@ -8,7 +8,7 @@ from typing import Optional, List, Dict, Any
 # ══════════════════════════════════════════════════════════════════════════════
 # ▶▶  YOUR FIREBASE URL — matches your ESP32 sketch and Render env var
 # ══════════════════════════════════════════════════════════════════════════════
-FIREBASE_URL = ("https://poultry-database-2b2d1-default-rtdb.firebaseio.com")
+FIREBASE_URL = "https://poultry-ai-e901a-default-rtdb.firebaseio.com"
 # ══════════════════════════════════════════════════════════════════════════════
 
 TIMEOUT   = 3
@@ -24,6 +24,9 @@ _cache: Dict[str, Any] = {
     "forecast_7d": None,
     "last_fetch":  0,
     "readings_limit": 0,
+    "readings_all": False,
+    "reading_count": None,
+    "count_fetch": 0,
     "online":      False,
 }
 _lock = threading.Lock()
@@ -59,6 +62,39 @@ def _dict_values(raw: Any) -> List[Dict]:
     if isinstance(raw, list):
         return [v for v in raw if isinstance(v, dict)]
     return []
+
+
+def _looks_like_reading(obj: Any) -> bool:
+    """Detect a real sensor reading row, not just a parent container."""
+    if not isinstance(obj, dict):
+        return False
+    has_time = any(k in obj for k in ("timestamp", "ts", "date", "createdAt"))
+    has_sensor = any(k in obj for k in ("weight", "totalLiters", "flow", "level"))
+    return bool(has_time and has_sensor)
+
+
+def _flatten_readings(raw: Any) -> List[Dict]:
+    """
+    Return every real reading from Firebase payloads.
+
+    This fixes accidental imports like /readings/readings/... and also prevents
+    data from being ignored when Firebase returns nested dictionaries/lists.
+    """
+    rows: List[Dict] = []
+
+    def walk(obj: Any) -> None:
+        if isinstance(obj, dict):
+            if _looks_like_reading(obj):
+                rows.append(obj)
+                return
+            for value in obj.values():
+                walk(value)
+        elif isinstance(obj, list):
+            for value in obj:
+                walk(value)
+
+    walk(raw)
+    return rows
 
 
 def _reading_sort_key(rec: Dict) -> float:
@@ -139,49 +175,99 @@ def get_latest() -> Optional[Dict]:
 
 def get_readings(limit: int = 300):
     """
-    Fetch last N readings from /readings ordered by timestamp.
-    Cached for CACHE_TTL seconds.
-    Firebase requires the 'timestamp' index to be defined in rules for
-    orderBy queries — if not set yet, results still come back unordered
-    and we sort client-side.
+    Fetch readings from /readings.
+
+    limit > 0  → fetch latest N rows for fast app views.
+    limit <= 0 → fetch ALL available rows for ML training/debug.
+
+    This version removes the old artificial 5,000-count behavior and also
+    flattens nested Firebase imports so rows are not wasted or ignored.
     """
     now = time.time()
+    fetch_all = limit is None or int(limit or 0) <= 0
+    req_limit = 0 if fetch_all else int(limit)
+
     with _lock:
-        cached = _cache["readings"]
-        last_f = _cache["last_fetch"]
+        cached = list(_cache.get("readings") or [])
+        last_f = float(_cache.get("last_fetch") or 0)
         cached_limit = int(_cache.get("readings_limit", 0) or 0)
+        cached_all = bool(_cache.get("readings_all", False))
 
-    # Only use cache if it was fetched with at least the requested limit.
-    # This prevents a small mobile query from breaking total count.
-    if cached and (now - last_f) < CACHE_TTL and cached_limit >= limit:
-        return cached[-limit:] if len(cached) > limit else cached
+    # Use cache only when it satisfies the request.
+    if cached and (now - last_f) < CACHE_TTL:
+        if fetch_all and cached_all:
+            return cached
+        if not fetch_all and (cached_all or cached_limit >= req_limit):
+            return cached[-req_limit:] if len(cached) > req_limit else cached
 
-    # Try ordered query first
-    raw = _get("readings", f'?orderBy="timestamp"&limitToLast={limit}')
-    if raw is None:
-        # Fallback: fetch without ordering (works even without index rules)
+    if fetch_all:
         raw = _get("readings")
+    else:
+        raw = _get("readings", f'?orderBy="timestamp"&limitToLast={req_limit}')
+        if raw is None:
+            raw = _get("readings")
 
-    readings = _dict_values(raw)
+    readings = _flatten_readings(raw)
     if readings:
-        # Client-side sort by timestamp. Legacy/partial rows are allowed.
         readings.sort(key=_reading_sort_key)
-        # Apply limit client-side
-        if len(readings) > limit:
-            readings = readings[-limit:]
+        if (not fetch_all) and len(readings) > req_limit:
+            readings = readings[-req_limit:]
+
         with _lock:
             _cache["readings"] = readings
             _cache["last_fetch"] = now
-            _cache["readings_limit"] = limit
+            _cache["readings_limit"] = 0 if fetch_all else req_limit
+            _cache["readings_all"] = fetch_all
+            if fetch_all:
+                _cache["reading_count"] = len(readings)
+                _cache["count_fetch"] = now
         return readings
 
     with _lock:
-        return _cache.get("readings", [])
+        cached = list(_cache.get("readings") or [])
+    if fetch_all:
+        return cached
+    return cached[-req_limit:] if cached and len(cached) > req_limit else cached
+
+
+def get_all_readings():
+    """Fetch all historical readings for the cloud ML server."""
+    return get_readings(limit=0)
 
 
 def get_reading_count() -> int:
-    """Count readings via cached list (Firebase has no COUNT)."""
-    return len(get_readings(limit=5000))
+    """
+    Count all /readings records without the old 5,000 artificial limit.
+
+    Primary method uses Firebase shallow=true so it counts keys without
+    downloading every row. If that fails or looks nested, it falls back to a
+    full flattened read.
+    """
+    now = time.time()
+    with _lock:
+        cached_count = _cache.get("reading_count")
+        count_fetch = float(_cache.get("count_fetch") or 0)
+    if cached_count is not None and (now - count_fetch) < CACHE_TTL:
+        return int(cached_count)
+
+    raw = _get("readings", "?shallow=true")
+    count = None
+    if isinstance(raw, dict):
+        # Normal import: /readings/<date-key> = row.  This gives the true count.
+        count = len(raw)
+        # If user accidentally imported root JSON inside /readings, shallow count may be 1.
+        if count <= 1 and "readings" in raw:
+            count = None
+    elif isinstance(raw, list):
+        count = len([x for x in raw if x is not None])
+
+    if count is None:
+        count = len(get_readings(limit=0))
+
+    with _lock:
+        _cache["reading_count"] = int(count)
+        _cache["count_fetch"] = now
+    return int(count)
 
 
 def get_ml_result() -> Optional[Dict]:
@@ -252,6 +338,8 @@ def get_cache_status() -> Dict:
         return {
             "online":      _cache["online"],
             "cached_rows": len(_cache["readings"]),
+            "cached_all": bool(_cache.get("readings_all", False)),
+            "reading_count": _cache.get("reading_count"),
             "has_latest":  _cache["latest"] is not None,
             "has_ml":      _cache["ml_result"] is not None,
             "last_fetch": _cache["last_fetch"],
@@ -272,13 +360,17 @@ def write_forecast_7d(rows: list) -> bool:
     return _put("forecast_7d", data)
 
 
-def write_ml_status(status: str, rows: int, error: str = "") -> bool:
-    return _put("ml_status", {
+def write_ml_status(status: str, rows: int, error: str = "", **extra) -> bool:
+    """Write cloud ML heartbeat/status. Extra keys are allowed for debug UI."""
+    payload = {
         "status":    status,
         "rows":      rows,
         "error":     error,
         "updatedAt": datetime.utcnow().isoformat(),
-    })
+    }
+    if extra:
+        payload.update(extra)
+    return _put("ml_status", payload)
 
 
 def push_alert(alert_type: str, message: str, value: float = 0.0) -> bool:
@@ -383,83 +475,3 @@ def get_cached_reading_count() -> int:
             return len(_cache.get("readings", []) or [])
     except Exception:
         return 0
- 
-
-# ═════════════════════════════════════════════════════════════════════════════
-# IMPROVED ML DATASET: actual consumption instead of raw remaining values
-# ═════════════════════════════════════════════════════════════════════════════
-def readings_to_consumption_df(readings: List[Dict]):
-    """
-    Convert ESP32 Firebase readings into an hourly consumption DataFrame for ML.
-
-    Why this is better:
-      - feed_kg becomes actual feed consumed, computed from weight decrease
-      - water_liters becomes actual water used, computed from totalLiters delta
-      - refills/resets/invalid jumps are ignored instead of being trained as real use
-
-    ESP still sends raw readings:
-      weight       = current feed/container weight
-      totalLiters  = cumulative water counter from the flow sensor
-
-    ML training receives:
-      feed_kg      = hourly feed consumption
-      water_liters = hourly water consumption
-    """
-    import pandas as pd
-
-    raw = readings_to_df(readings)
-    if raw is None or raw.empty:
-        return pd.DataFrame()
-
-    df = raw.copy().sort_values("date").reset_index(drop=True)
-    if len(df) < 2:
-        return df
-
-    # Raw values from ESP32.
-    df["feed_weight_raw"] = pd.to_numeric(df["feed_kg"], errors="coerce").fillna(0).clip(lower=0)
-    df["water_total_raw"] = pd.to_numeric(df["water_liters"], errors="coerce").fillna(0).clip(lower=0)
-
-    # Time gap helps reject very stale jumps.
-    df["dt_seconds"] = df["date"].diff().dt.total_seconds().fillna(0).clip(lower=0)
-
-    # Feed consumed = previous weight - current weight.
-    # If weight increases, that is likely refill/add feed, not consumption.
-    feed_drop = df["feed_weight_raw"].shift(1) - df["feed_weight_raw"]
-    df["feed_consumed"] = feed_drop.where((feed_drop > 0.005) & (feed_drop <= 5.0), 0.0)
-
-    # Water consumed = current totalLiters - previous totalLiters.
-    # If totalLiters decreases, the ESP counter was reset; ignore that interval.
-    water_delta = df["water_total_raw"] - df["water_total_raw"].shift(1)
-    df["water_consumed"] = water_delta.where((water_delta > 0.0005) & (water_delta <= 20.0), 0.0)
-
-    # Reject impossible intervals from stale/disconnected data.
-    # Normal Firebase sends are seconds apart; if a gap is very long, the next delta may be misleading.
-    stale = df["dt_seconds"] > 3600
-    df.loc[stale, ["feed_consumed", "water_consumed"]] = 0.0
-
-    # Group by hour so ML predicts consumption pattern, not every noisy raw sensor tick.
-    df["hour_bucket"] = df["date"].dt.floor("H")
-    g = df.groupby("hour_bucket", as_index=False).agg(
-        feed_kg=("feed_consumed", "sum"),
-        water_liters=("water_consumed", "sum"),
-        flow=("flow", "mean"),
-        level=("level", "last"),
-        system=("system", "last"),
-    )
-    g = g.rename(columns={"hour_bucket": "date"})
-    g["day_of_week"] = pd.to_datetime(g["date"]).dt.dayofweek
-    g["month"] = pd.to_datetime(g["date"]).dt.month
-
-    # Keep only non-negative, sensible values.
-    g["feed_kg"] = pd.to_numeric(g["feed_kg"], errors="coerce").fillna(0).clip(lower=0, upper=10)
-    g["water_liters"] = pd.to_numeric(g["water_liters"], errors="coerce").fillna(0).clip(lower=0, upper=50)
-
-    # If there is not enough real movement yet, fall back to raw rows so ML status does not break,
-    # but mark it clearly for the server/status output.
-    if len(g) < 5 or (g["feed_kg"].sum() <= 0 and g["water_liters"].sum() <= 0):
-        fallback = raw.copy()
-        fallback["data_mode"] = "raw_fallback_no_valid_consumption_yet"
-        return fallback
-
-    g["data_mode"] = "hourly_actual_consumption"
-    return g.sort_values("date").reset_index(drop=True)
