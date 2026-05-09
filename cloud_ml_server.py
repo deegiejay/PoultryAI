@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import base64
 import io
 import math
@@ -213,9 +214,13 @@ def fetch_all_readings() -> Tuple[List[Dict[str, Any]], int]:
 
     if raw is None:
         # Fallback through firebase_db cache/query if direct fetch fails.
-        fallback_limit = MAX_RAW_ROWS if MAX_RAW_ROWS > 0 else 50000
+        # limit=0 means ALL readings, so no dataset is wasted by a count cap.
         try:
-            readings = db.get_readings(limit=fallback_limit)
+            if hasattr(db, "get_all_readings") and MAX_RAW_ROWS <= 0:
+                readings = db.get_all_readings()
+            else:
+                fallback_limit = MAX_RAW_ROWS if MAX_RAW_ROWS > 0 else 0
+                readings = db.get_readings(limit=fallback_limit)
             return readings, len(readings)
         except Exception:
             return [], 0
@@ -787,7 +792,7 @@ def train_once() -> bool:
         readings, raw_count = fetch_all_readings()
         if not readings:
             msg = "No data in Firebase /readings yet."
-            db.write_ml_status("waiting", 0, msg)
+            db.write_ml_status("waiting", 0, msg, rawRows=0, validRows=0, trainingMode="continuous_all_valid_historical_data")
             with _lock:
                 state.update(training=False, status="waiting", raw_rows=0, valid_rows=0, error=msg)
             return False
@@ -800,7 +805,7 @@ def train_once() -> bool:
 
         if hourly_df.empty or valid_rows < MIN_VALID_ROWS:
             msg = f"Collecting valid consumption data: need {MIN_VALID_ROWS} hourly rows, have {valid_rows}."
-            db.write_ml_status("collecting", valid_rows, msg)
+            db.write_ml_status("collecting", valid_rows, msg, rawRows=raw_rows, validRows=valid_rows, validDays=valid_days, removedRows=removed_rows, trainingMode="continuous_all_valid_historical_data")
             with _lock:
                 state.update(
                     training=False,
@@ -912,7 +917,7 @@ def train_once() -> bool:
 
         ok1 = db.write_ml_result(ml_result)
         ok2 = db.write_forecast_7d(forecast_rows)
-        db.write_ml_status("ready", valid_rows)
+        db.write_ml_status("ready", valid_rows, "", rawRows=raw_rows, validRows=valid_rows, validDays=valid_days, removedRows=removed_rows, trainingMode="continuous_all_valid_historical_data", dataMode="hourly_consumption")
         if anomaly["anomaly"]:
             db.push_alert("anomaly", anomaly["message"], anomaly["value"])
 
@@ -970,7 +975,7 @@ def training_loop() -> None:
 
             readings, raw_count = fetch_all_readings()
             if raw_count <= 0:
-                db.write_ml_status("waiting", 0, "No data in Firebase /readings yet.")
+                db.write_ml_status("waiting", 0, "No data in Firebase /readings yet.", rawRows=0, validRows=0, trainingMode="continuous_all_valid_historical_data")
                 with _lock:
                     state.update(status="waiting", raw_rows=0)
                 continue
@@ -991,7 +996,7 @@ def training_loop() -> None:
 # FASTAPI ENDPOINTS
 # ═════════════════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="Poultry Farm ML Server", version="continuous-consumption-v2")
+app = FastAPI(title="Poultry Farm ML Server", version="continuous-consumption-v3")
 
 
 @app.get("/")
@@ -1000,7 +1005,7 @@ async def root():
         s = dict(state)
     return JSONResponse({
         "service": "Poultry Farm ML Server",
-        "version": "continuous-consumption-v2",
+        "version": "continuous-consumption-v3",
         "description": "Trains on all valid historical readings and predicts daily feed/water consumption targets.",
         "state": s,
     })
@@ -1026,6 +1031,7 @@ async def debug_data():
     last_date = str(raw_df["date"].max()) if not raw_df.empty else ""
     return JSONResponse({
         "rawRowsFetched": raw_count,
+        "firebaseReadingCount": db.get_reading_count() if hasattr(db, "get_reading_count") else raw_count,
         "acceptedRawRows": int(len(raw_df)),
         "validHourlyConsumptionRows": int(len(hourly_df)),
         "validDays": days,
